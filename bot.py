@@ -1027,13 +1027,21 @@ def _cb(call):
             state_clear(uid)
             filter_id = db.create_filter(**nf)
             bot.edit_message_text(f"✅ Фильтр <b>{nf['name']}</b> создан!", cid, mid)
-            bot.send_message(cid, "⏳ Ищу первые вакансии...", reply_markup=kb_menu())
-            vacancies = hh_api.search_vacancies(nf, per_page=INITIAL_VACANCIES_COUNT)
-            if vacancies:
-                send_vacancies(filter_id, vacancies[:INITIAL_VACANCIES_COUNT],
-                               f"🔍 Первые вакансии по фильтру <b>{nf['name']}</b>:")
+            bot.send_message(cid, "⏳ Ищу свежие вакансии...", reply_markup=kb_menu())
+
+            # Пометить ВСЕ вакансии за 30 дней как просмотренные,
+            # чтобы периодический чекер не присылал старьё
+            old = hh_api.search_vacancies(nf, per_page=100)
+            if old:
+                db.mark_seen(filter_id, [v["id"] for v in old])
+
+            # Показать только свежие вакансии (за последний день)
+            fresh = hh_api.search_vacancies(nf, per_page=INITIAL_VACANCIES_COUNT, periods=[1])
+            if fresh:
+                send_vacancies(filter_id, fresh[:INITIAL_VACANCIES_COUNT],
+                               f"🔍 Свежие вакансии по фильтру <b>{nf['name']}</b>:")
             else:
-                bot.send_message(cid, "По фильтру пока ничего не найдено. Буду проверять каждые 5 минут.")
+                bot.send_message(cid, "Свежих вакансий за сегодня нет. Буду проверять каждые 5 минут.")
         return
 
     # ── Edit multi-select (experience / employment / schedule) ────────────────
