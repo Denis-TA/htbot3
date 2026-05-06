@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import re
@@ -1384,6 +1385,18 @@ def vacancy_checker():
             log.error("Checker error: %s", e)
 
 
+def _is_recent(v: dict, max_days: int = 7) -> bool:
+    """Return True if vacancy was published within last max_days days."""
+    pub = v.get("published_at", "")
+    if not pub:
+        return True  # дата неизвестна — показываем
+    try:
+        d = datetime.datetime.strptime(pub, "%d.%m.%Y").date()
+        return (datetime.date.today() - d).days <= max_days
+    except Exception:
+        return True
+
+
 def _run_check():
     filters = db.get_active_filters()
     for f in filters:
@@ -1397,7 +1410,19 @@ def _run_check():
         if not new_ones:
             continue
 
-        limited = new_ones[:MAX_NEW_VACANCIES]
+        # Старые вакансии (поднятые работодателем) — пометить как просмотренные,
+        # но не показывать пользователю
+        recent = [v for v in new_ones if _is_recent(v, max_days=7)]
+        stale  = [v for v in new_ones if not _is_recent(v, max_days=7)]
+        if stale:
+            log.info("Filter '%s': silently marking %d stale vacancies as seen",
+                     f["name"], len(stale))
+            db.mark_seen(f["id"], [v["id"] for v in stale])
+
+        if not recent:
+            continue
+
+        limited = recent[:MAX_NEW_VACANCIES]
         log.info("Filter '%s': %d new vacancies", f["name"], len(limited))
         send_vacancies(f["id"], limited,
                        f"🆕 <b>{f['name']}</b> — {len(limited)} новых вакансий:")
