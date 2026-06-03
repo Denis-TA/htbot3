@@ -41,7 +41,9 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 # ── Состояния диалога ─────────────────────────────────────────────────────────
 user_state: dict = {}
 
-# Pending AI requests: uid → {cid, mid, card_text, vacancy_url, vacancy_id, resume_id}
+# Pending AI requests: uid → {mode, cid, card_mid, prompt_mid, card_text,
+#   vacancy_url, vacancy_id, resume_id, lie_level}
+# mode="vacancy" (from a vacancy card) | "standalone" (from /p or menu button)
 _ai_pending: dict = {}
 
 EXPERIENCE_OPTIONS = [
@@ -72,13 +74,14 @@ BTN_CREATE   = "➕ Создать фильтр"
 BTN_PROGRESS = "📊 Прогресс"
 BTN_RESUMES  = "📄 Резюме"
 BTN_PROMPT   = "⚙️ Промпт ИИ"
+BTN_COVER    = "✉️ Сопроводительное"
 
 
 def kb_menu():
     m = ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(KeyboardButton(BTN_FILTERS), KeyboardButton(BTN_CREATE))
     m.row(KeyboardButton(BTN_PROGRESS), KeyboardButton(BTN_RESUMES))
-    m.add(KeyboardButton(BTN_PROMPT))
+    m.row(KeyboardButton(BTN_COVER), KeyboardButton(BTN_PROMPT))
     return m
 
 
@@ -421,6 +424,25 @@ def cmd_progress(msg):
     _show_progress_menu(msg.chat.id)
 
 
+@bot.message_handler(commands=["p"])
+def cmd_cover_letter(msg):
+    """/p <hh.ru vacancy url> — generate a cover letter for the vacancy."""
+    if not is_owner(msg):
+        return
+    state_clear(msg.from_user.id)
+    # Everything after the command is the URL
+    parts = (msg.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(
+            msg.chat.id,
+            "✉️ <b>Сопроводительное письмо</b>\n\n"
+            "Используй: <code>/p ссылка-на-вакансию</code>\n"
+            "Пример: <code>/p https://hh.ru/vacancy/12345678</code>",
+        )
+        return
+    _start_cover_letter(msg.from_user.id, msg.chat.id, parts[1].strip())
+
+
 # ── Document handler (for .txt resume / prompt uploads) ───────────────────────
 
 @bot.message_handler(content_types=["document"])
@@ -535,6 +557,14 @@ def handle_text(msg):
         state_clear(uid)
         _show_prompt_menu(cid)
         return
+    if text == BTN_COVER:
+        state_set(uid, "cover_await_url")
+        bot.send_message(
+            cid,
+            "✉️ <b>Сопроводительное письмо</b>\n\n"
+            "Пришли ссылку на вакансию с hh.ru:",
+        )
+        return
 
     if not step:
         return
@@ -552,6 +582,13 @@ def handle_text(msg):
 def _handle_text_inner(uid, cid, text, step, st):
     d  = st.get("data", {})
     nf = d.get("nf", {})
+
+    # ── Cover letter URL input ──────────────────────────────────────────────
+
+    if step == "cover_await_url":
+        state_clear(uid)
+        _start_cover_letter(uid, cid, text.strip())
+        return
 
     # ── Progress input ────────────────────────────────────────────────────────
 
@@ -1111,7 +1148,7 @@ def _cb(call):
     # ── AI cover letter flow ──────────────────────────────────────────────────
 
     if data.startswith("ai_") and not data.startswith("ai_res_") and not data.startswith("ai_lie_"):
-        # Step 1: user clicked "🤖 ИИ-отклик"
+        # Step 1: user clicked "🤖 ИИ-отклик" under a vacancy card
         vacancy_id = data[3:]
 
         # Extract URL from message HTML
@@ -1120,25 +1157,16 @@ def _cb(call):
         url_m = re.search(r'href="(https://[^"]*hh\.ru/vacancy/\d+)', msg_html)
         vacancy_url = url_m.group(1) if url_m else f"https://hh.ru/vacancy/{vacancy_id}"
 
-        # Store pending request
         _ai_pending[uid] = {
-            "cid":        cid,
-            "mid":        mid,
-            "card_text":  msg_text,
+            "mode":        "vacancy",
+            "cid":         cid,
+            "card_mid":    mid,
+            "prompt_mid":  mid,
+            "card_text":   msg_text,
             "vacancy_url": vacancy_url,
-            "vacancy_id": vacancy_id,
+            "vacancy_id":  vacancy_id,
         }
-
-        resumes = db.get_resumes()
-        if not resumes:
-            # No resumes — generate immediately without resume
-            _ai_pending[uid]["resume_id"] = 0
-            _ai_generate(uid)
-        else:
-            bot.edit_message_reply_markup(
-                cid, mid,
-                reply_markup=kb_ai_resume_select(resumes),
-            )
+        _ai_choose_resume_or_generate(uid)
         return
 
     if data.startswith("ai_res_"):
@@ -1146,24 +1174,19 @@ def _cb(call):
         resume_id = int(data[7:])
         pending = _ai_pending.get(uid)
         if not pending:
-            bot.answer_callback_query(call.id, "Устарело, нажми 🤖 ИИ-отклик снова")
+            bot.answer_callback_query(call.id, "Устарело, начни заново")
             return
 
-        pending["resume_id"] = resume_id
-        cid_ = pending["cid"]
-        mid_ = pending["mid"]
+        pending["resume_id"]  = resume_id
+        pending["prompt_mid"] = mid
 
         if resume_id == 0:
-            # No resume — generate directly
             _ai_generate(uid)
         else:
-            # Show lie level selection
             r = db.get_resume(resume_id)
             name = r["name"] if r else "Резюме"
-            bot.edit_message_reply_markup(
-                cid_, mid_,
-                reply_markup=kb_ai_lie_level(),
-            )
+            _ai_show_kb(uid, kb_ai_lie_level(),
+                        f"✉️ Резюме: «{name}».\nВыбери степень достоверности:")
             bot.answer_callback_query(call.id, f"Резюме: {name}")
         return
 
@@ -1172,10 +1195,11 @@ def _cb(call):
         lie_level = int(data[7:])
         pending = _ai_pending.get(uid)
         if not pending:
-            bot.answer_callback_query(call.id, "Устарело, нажми 🤖 ИИ-отклик снова")
+            bot.answer_callback_query(call.id, "Устарело, начни заново")
             return
 
-        pending["lie_level"] = lie_level
+        pending["lie_level"]  = lie_level
+        pending["prompt_mid"] = mid
         _ai_generate(uid)
         return
 
@@ -1309,14 +1333,102 @@ def _cb(call):
 
 # ── AI generation (background thread) ────────────────────────────────────────
 
+def _normalize_vacancy_url(raw: str) -> str | None:
+    """Extract / normalize an hh.ru vacancy URL (or bare id) from user input."""
+    raw = (raw or "").strip()
+    m = re.search(r"((?:https?://)?[\w.-]*hh\.ru/vacancy/\d+)", raw)
+    if m:
+        url = m.group(1)
+        if not url.startswith("http"):
+            url = "https://" + url
+        return url
+    if raw.isdigit() and len(raw) >= 5:
+        return f"https://hh.ru/vacancy/{raw}"
+    return None
+
+
+def _start_cover_letter(uid: int, cid: int, raw_url: str):
+    """Entry point for standalone cover-letter flow (/p command and menu button)."""
+    url = _normalize_vacancy_url(raw_url)
+    if not url:
+        bot.send_message(
+            cid,
+            "❌ Не похоже на ссылку на вакансию hh.ru.\n"
+            "Пример: <code>https://hh.ru/vacancy/12345678</code>",
+            reply_markup=kb_menu(),
+        )
+        return
+
+    vid_m = re.search(r"/vacancy/(\d+)", url)
+    vacancy_id = vid_m.group(1) if vid_m else url
+
+    host = bot.send_message(cid, "✉️ Готовлю сопроводительное…")
+    _ai_pending[uid] = {
+        "mode":        "standalone",
+        "cid":         cid,
+        "card_mid":    None,
+        "prompt_mid":  host.message_id,
+        "card_text":   "",
+        "vacancy_url": url,
+        "vacancy_id":  vacancy_id,
+    }
+    _ai_choose_resume_or_generate(uid)
+
+
+def _ai_show_kb(uid: int, kb, standalone_text: str):
+    """Show a selection keyboard, mode-aware.
+
+    vacancy mode  → edit only the markup of the vacancy card.
+    standalone    → edit text + markup of the host message.
+    """
+    pending = _ai_pending.get(uid)
+    if not pending:
+        return
+    cid  = pending["cid"]
+    pmid = pending["prompt_mid"]
+    try:
+        if pending["mode"] == "standalone":
+            bot.edit_message_text(standalone_text, cid, pmid, reply_markup=kb)
+        else:
+            bot.edit_message_reply_markup(cid, pmid, reply_markup=kb)
+    except Exception:
+        pass
+
+
+def _ai_choose_resume_or_generate(uid: int):
+    """Decide next step: no resume → generate; 1 resume → auto-pick + ask lie;
+    several → ask which resume."""
+    pending = _ai_pending.get(uid)
+    if not pending:
+        return
+
+    resumes = db.get_resumes()
+    if not resumes:
+        pending["resume_id"] = 0
+        _ai_generate(uid)
+        return
+
+    if len(resumes) == 1:
+        pending["resume_id"] = resumes[0]["id"]
+        _ai_show_kb(
+            uid, kb_ai_lie_level(),
+            f"✉️ Резюме: «{resumes[0]['name']}».\nВыбери степень достоверности:",
+        )
+        return
+
+    _ai_show_kb(uid, kb_ai_resume_select(resumes), "✉️ С каким резюме писать?")
+
+
 def _ai_generate(uid: int):
     """Start background AI generation using data from _ai_pending[uid]."""
     pending = _ai_pending.pop(uid, None)
     if not pending:
         return
 
+    mode        = pending.get("mode", "vacancy")
     cid         = pending["cid"]
-    mid         = pending["mid"]
+    card_mid    = pending.get("card_mid")
+    prompt_mid  = pending.get("prompt_mid")
     card_text   = pending["card_text"]
     vacancy_url = pending["vacancy_url"]
     vacancy_id  = pending["vacancy_id"]
@@ -1325,20 +1437,21 @@ def _ai_generate(uid: int):
 
     # Show spinner
     try:
-        spinner_kb = InlineKeyboardMarkup()
-        spinner_kb.add(InlineKeyboardButton("⏳ Генерирую отклик...", callback_data="noop"))
-        bot.edit_message_reply_markup(cid, mid, reply_markup=spinner_kb)
+        if mode == "standalone":
+            bot.edit_message_text("⏳ Генерирую сопроводительное…", cid, prompt_mid)
+        else:
+            spinner_kb = InlineKeyboardMarkup()
+            spinner_kb.add(InlineKeyboardButton("⏳ Генерирую отклик...", callback_data="noop"))
+            bot.edit_message_reply_markup(cid, prompt_mid, reply_markup=spinner_kb)
     except Exception:
         pass
 
     def _worker():
-        # Load resume
         resume_text = None
         if resume_id:
             r = db.get_resume(resume_id)
             resume_text = r["text"] if r else None
 
-        # Load custom prompt template
         prompt_template = db.get_setting("groq_prompt") or None
 
         page_text = ai.fetch_vacancy_page(vacancy_url)
@@ -1350,25 +1463,38 @@ def _ai_generate(uid: int):
             prompt_template=prompt_template,
         )
 
-        # Build header with params
+        tag = "ИИ-отклик" if mode == "vacancy" else "Сопроводительное"
         if resume_id and resume_text:
             r = db.get_resume(resume_id)
             rname = r["name"] if r else "Резюме"
             lie_labels = {1: "честно", 2: "немного", 3: "свободно"}
-            header = f"🤖 <b>ИИ-отклик</b>  |  📄 {rname}  |  уровень {lie_level} ({lie_labels[lie_level]})\n\n"
+            header = (f"🤖 <b>{tag}</b>  |  📄 {rname}  |  "
+                      f"уровень {lie_level} ({lie_labels[lie_level]})\n\n")
         else:
-            header = "🤖 <b>ИИ-отклик</b>  |  без резюме\n\n"
+            header = f"🤖 <b>{tag}</b>  |  без резюме\n\n"
 
-        try:
-            bot.send_message(cid, header + result, reply_to_message_id=mid)
-        except Exception as e:
-            log.error("Failed to send AI response: %s", e)
-
-        # Restore original buttons
-        try:
-            bot.edit_message_reply_markup(cid, mid, reply_markup=kb_vacancy_actions(vacancy_id))
-        except Exception:
-            pass
+        if mode == "standalone":
+            footer = f"\n\n🔗 {vacancy_url}"
+            try:
+                bot.edit_message_text(header + result + footer, cid, prompt_mid,
+                                      disable_web_page_preview=True)
+            except Exception:
+                try:
+                    bot.send_message(cid, header + result + footer,
+                                     disable_web_page_preview=True)
+                except Exception as e:
+                    log.error("Failed to send cover letter: %s", e)
+        else:
+            try:
+                bot.send_message(cid, header + result, reply_to_message_id=card_mid)
+            except Exception as e:
+                log.error("Failed to send AI response: %s", e)
+            # Restore original vacancy buttons
+            try:
+                bot.edit_message_reply_markup(cid, card_mid,
+                                              reply_markup=kb_vacancy_actions(vacancy_id))
+            except Exception:
+                pass
 
     threading.Thread(target=_worker, daemon=True).start()
 
