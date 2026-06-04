@@ -154,9 +154,11 @@ def search_vacancies(f: dict, per_page: int = 100,
     exp = _multi(f.get("experience"))
     emp = _multi(f.get("employment"))
     sch = _multi(f.get("schedule"))
-    if exp: base_params["experience"] = exp
-    if emp: base_params["employment"] = emp
-    if sch: base_params["schedule"]   = sch
+    wf  = _multi(f.get("work_format"))
+    if exp: base_params["experience"]  = exp
+    if emp: base_params["employment"]  = emp
+    if sch: base_params["schedule"]    = sch
+    if wf:  base_params["work_format"] = wf
 
     seen:    set  = set()
     results: list = []

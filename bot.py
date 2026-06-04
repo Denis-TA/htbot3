@@ -1,4 +1,5 @@
 import datetime
+import html
 import logging
 import os
 import re
@@ -41,11 +42,6 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 # ── Состояния диалога ─────────────────────────────────────────────────────────
 user_state: dict = {}
 
-# Pending AI requests: uid → {mode, cid, card_mid, prompt_mid, card_text,
-#   vacancy_url, vacancy_id, resume_id, lie_level}
-# mode="vacancy" (from a vacancy card) | "standalone" (from /p or menu button)
-_ai_pending: dict = {}
-
 EXPERIENCE_OPTIONS = [
     ("Без опыта",   "noExperience"),
     ("1–3 года",    "between1And3"),
@@ -65,6 +61,13 @@ SCHEDULE_OPTIONS = [
     ("Удалённо",    "remote"),
     ("Вахта",       "flyInFlyOut"),
 ]
+WORK_FORMAT_OPTIONS = [
+    ("Офис",     "ON_SITE"),
+    ("Удалёнка", "REMOTE"),
+    ("Гибрид",   "HYBRID"),
+]
+
+LIE_LABELS = {1: "строго по тексту", 2: "с дополнениями", 3: "свободно"}
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -74,14 +77,14 @@ BTN_CREATE   = "➕ Создать фильтр"
 BTN_PROGRESS = "📊 Прогресс"
 BTN_RESUMES  = "📄 Резюме"
 BTN_PROMPT   = "⚙️ Промпт ИИ"
-BTN_COVER    = "✉️ Сопроводительное"
+BTN_LETTER   = "✉️ Настройки письма"
 
 
 def kb_menu():
     m = ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(KeyboardButton(BTN_FILTERS), KeyboardButton(BTN_CREATE))
     m.row(KeyboardButton(BTN_PROGRESS), KeyboardButton(BTN_RESUMES))
-    m.row(KeyboardButton(BTN_COVER), KeyboardButton(BTN_PROMPT))
+    m.row(KeyboardButton(BTN_LETTER), KeyboardButton(BTN_PROMPT))
     return m
 
 
@@ -153,6 +156,7 @@ def kb_edit_menu():
         InlineKeyboardButton("Занятость",      callback_data="ef_employment"),
         InlineKeyboardButton("График",         callback_data="ef_schedule"),
     )
+    m.add(InlineKeyboardButton("🏠 Формат (офис/удал./гибрид)", callback_data="ef_work_format"))
     m.add(InlineKeyboardButton("✅ Готово",    callback_data="ef_done"))
     return m
 
@@ -187,21 +191,20 @@ def kb_resume_actions(resume_id: int) -> InlineKeyboardMarkup:
     return m
 
 
-def kb_ai_resume_select(resumes: list) -> InlineKeyboardMarkup:
-    """Shown when user clicks ИИ-отклик — choose which resume to use."""
+def kb_letter_settings(resumes: list, cur_resume_id: int, cur_lie: int) -> InlineKeyboardMarkup:
+    """Settings menu: pick default resume + lie level for cover letters."""
     m = InlineKeyboardMarkup()
+    # Resume choices
     for r in resumes:
-        m.add(InlineKeyboardButton(f"📄 {r['name']}", callback_data=f"ai_res_{r['id']}"))
-    m.add(InlineKeyboardButton("🚫 Без резюме", callback_data="ai_res_0"))
-    return m
-
-
-def kb_ai_lie_level() -> InlineKeyboardMarkup:
-    m = InlineKeyboardMarkup()
+        mark = "🔘" if r["id"] == cur_resume_id else "⚪"
+        m.add(InlineKeyboardButton(f"{mark} 📄 {r['name']}", callback_data=f"setres_{r['id']}"))
+    none_mark = "🔘" if cur_resume_id == 0 else "⚪"
+    m.add(InlineKeyboardButton(f"{none_mark} 🚫 Без резюме", callback_data="setres_0"))
+    # Lie level
     m.row(
-        InlineKeyboardButton("1 — Строго по тексту",    callback_data="ai_lie_1"),
-        InlineKeyboardButton("2 — С дополнениями",   callback_data="ai_lie_2"),
-        InlineKeyboardButton("3 — Свободно",  callback_data="ai_lie_3"),
+        InlineKeyboardButton(("🔘" if cur_lie == 1 else "⚪") + " 1 строго", callback_data="setlie_1"),
+        InlineKeyboardButton(("🔘" if cur_lie == 2 else "⚪") + " 2 чуть",   callback_data="setlie_2"),
+        InlineKeyboardButton(("🔘" if cur_lie == 3 else "⚪") + " 3 свободно", callback_data="setlie_3"),
     )
     return m
 
@@ -224,12 +227,35 @@ def is_owner(message_or_id):
     return uid == OWNER_ID
 
 
-def send_vacancies(filter_id, vacancies, header):
+def _enrich_work_format(vacancies):
+    """Best-effort: fill v['work_format'] for each vacancy by reading its page.
+    Runs page fetches concurrently; failures are silent."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(v):
+        try:
+            url = v.get("alternate_url", "")
+            if url:
+                v["work_format"] = ai.fetch_work_format(url)
+        except Exception:
+            pass
+
     try:
-        bot.send_message(OWNER_ID, header)
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            list(ex.map(_one, vacancies))
     except Exception as e:
-        log.error("Failed to send header for filter %s: %s", filter_id, e)
-        return
+        log.debug("work_format enrich failed: %s", e)
+
+
+def send_vacancies(filter_id, vacancies, header=None):
+    """Send vacancy cards to the owner. No noisy header unless explicitly given."""
+    if header:
+        try:
+            bot.send_message(OWNER_ID, header)
+        except Exception as e:
+            log.error("Failed to send header for filter %s: %s", filter_id, e)
+
+    _enrich_work_format(vacancies)
 
     sent_ids = []
     for v in vacancies:
@@ -319,6 +345,60 @@ def _show_prompt_menu(cid: int):
     else:
         m.add(InlineKeyboardButton("📋 Установить стандартный как основу", callback_data="prom_load_default"))
     bot.send_message(cid, text, reply_markup=m)
+
+
+def _resolve_cover_settings():
+    """Return (resume_id, lie_level) from saved settings, with smart defaults.
+
+    resume_id: explicit setting wins; '0' = no resume; otherwise auto —
+    single resume → that one, several → most recent, none → 0.
+    """
+    lie = db.get_setting("cover_lie_level", "1")
+    lie = int(lie) if lie.isdigit() and int(lie) in (1, 2, 3) else 1
+
+    raw = db.get_setting("cover_resume_id", "")
+    resumes = db.get_resumes()
+    if raw == "0":
+        return 0, lie
+    if raw.isdigit() and db.get_resume(int(raw)):
+        return int(raw), lie
+    # auto
+    if len(resumes) >= 1:
+        return resumes[0]["id"], lie   # most recent
+    return 0, lie
+
+
+def _show_letter_settings(cid: int, mid: int = None):
+    resume_id, lie = _resolve_cover_settings()
+    resumes = db.get_resumes()
+
+    if resume_id and db.get_resume(resume_id):
+        rname = db.get_resume(resume_id)["name"]
+    else:
+        rname = "без резюме"
+
+    raw = db.get_setting("cover_resume_id", "")
+    auto_note = "" if (raw == "0" or raw.isdigit()) else "  (авто)"
+
+    text = (
+        "✉️ <b>Настройки сопроводительного письма</b>\n\n"
+        f"📄 Резюме: <b>{rname}</b>{auto_note}\n"
+        f"🎚 Достоверность: <b>{lie} — {LIE_LABELS[lie]}</b>\n\n"
+        "Теперь просто <b>пришли ссылку</b> на вакансию hh.ru в чат — "
+        "и получишь готовое письмо с этими настройками.\n\n"
+        "Уровни достоверности:\n"
+        "1 — только то, что есть в резюме\n"
+        "2 — немного дополнить смежным\n"
+        "3 — свободно дописывать опыт"
+    )
+    kb = kb_letter_settings(resumes, resume_id if (raw == "0" or raw.isdigit()) else -1, lie)
+    if mid:
+        try:
+            bot.edit_message_text(text, cid, mid, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    bot.send_message(cid, text, reply_markup=kb)
 
 
 def _show_progress_menu(cid: int):
@@ -422,25 +502,6 @@ def cmd_progress(msg):
     if not is_owner(msg):
         return
     _show_progress_menu(msg.chat.id)
-
-
-@bot.message_handler(commands=["p"])
-def cmd_cover_letter(msg):
-    """/p <hh.ru vacancy url> — generate a cover letter for the vacancy."""
-    if not is_owner(msg):
-        return
-    state_clear(msg.from_user.id)
-    # Everything after the command is the URL
-    parts = (msg.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        bot.send_message(
-            msg.chat.id,
-            "✉️ <b>Сопроводительное письмо</b>\n\n"
-            "Используй: <code>/p ссылка-на-вакансию</code>\n"
-            "Пример: <code>/p https://hh.ru/vacancy/12345678</code>",
-        )
-        return
-    _start_cover_letter(msg.from_user.id, msg.chat.id, parts[1].strip())
 
 
 # ── Document handler (for .txt resume / prompt uploads) ───────────────────────
@@ -557,16 +618,16 @@ def handle_text(msg):
         state_clear(uid)
         _show_prompt_menu(cid)
         return
-    if text == BTN_COVER:
-        state_set(uid, "cover_await_url")
-        bot.send_message(
-            cid,
-            "✉️ <b>Сопроводительное письмо</b>\n\n"
-            "Пришли ссылку на вакансию с hh.ru:",
-        )
+    if text == BTN_LETTER:
+        state_clear(uid)
+        _show_letter_settings(cid)
         return
 
     if not step:
+        # No active dialog — if it's an hh.ru vacancy link, write a cover letter.
+        url = _normalize_vacancy_url(text)
+        if url:
+            _cover_from_link(cid, url)
         return
 
     try:
@@ -582,13 +643,6 @@ def handle_text(msg):
 def _handle_text_inner(uid, cid, text, step, st):
     d  = st.get("data", {})
     nf = d.get("nf", {})
-
-    # ── Cover letter URL input ──────────────────────────────────────────────
-
-    if step == "cover_await_url":
-        state_clear(uid)
-        _start_cover_letter(uid, cid, text.strip())
-        return
 
     # ── Progress input ────────────────────────────────────────────────────────
 
@@ -893,12 +947,14 @@ def _cb(call):
             bot.edit_message_text("Только вакансии с зарплатой?", cid, mid, reply_markup=m)
             return
 
-        if field in ("experience", "employment", "schedule"):
+        if field in ("experience", "employment", "schedule", "work_format"):
             f_data = db.get_filter(filter_id)
             sel = _parse_multi(f_data.get(field)) if f_data else []
             state_set(uid, "edit_ms", filter_id=filter_id, field=field, sel=sel)
-            labels  = {"experience": "Опыт работы:", "employment": "Тип занятости:", "schedule": "График работы:"}
-            opts    = {"experience": EXPERIENCE_OPTIONS, "employment": EMPLOYMENT_OPTIONS, "schedule": SCHEDULE_OPTIONS}
+            labels  = {"experience": "Опыт работы:", "employment": "Тип занятости:",
+                       "schedule": "График работы:", "work_format": "Формат работы:"}
+            opts    = {"experience": EXPERIENCE_OPTIONS, "employment": EMPLOYMENT_OPTIONS,
+                       "schedule": SCHEDULE_OPTIONS, "work_format": WORK_FORMAT_OPTIONS}
             bot.edit_message_text(labels[field], cid, mid,
                                   reply_markup=kb_multiselect(opts[field], sel, "ems_", "ems_done", back_cb="ems_back"))
             return
@@ -1047,6 +1103,22 @@ def _cb(call):
                 reply_markup=kb_multiselect(SCHEDULE_OPTIONS, sel, "csp_", "csp_done", "csp_skip"))
             return
         nf["schedule"] = None if data == "csp_skip" else _serialize_multi(sel)
+        state_set(uid, "create_work_format", nf=nf, sel=[])
+        bot.edit_message_text("Формат работы (офис / удалёнка / гибрид):", cid, mid,
+                              reply_markup=kb_multiselect(WORK_FORMAT_OPTIONS, [], "cwf_", "cwf_done", "cwf_skip"))
+        return
+
+    if step == "create_work_format":
+        sel = list(d.get("sel", []))
+        if data.startswith("cwf_") and data not in ("cwf_skip", "cwf_done"):
+            val = data[4:]
+            if val in sel: sel.remove(val)
+            else: sel.append(val)
+            state_set(uid, "create_work_format", nf=nf, sel=sel)
+            bot.edit_message_reply_markup(cid, mid,
+                reply_markup=kb_multiselect(WORK_FORMAT_OPTIONS, sel, "cwf_", "cwf_done", "cwf_skip"))
+            return
+        nf["work_format"] = None if data == "cwf_skip" else _serialize_multi(sel)
         state_set(uid, "create_confirm", nf=nf)
         summary = format_filter_info({**nf, "is_active": 1})
         m = InlineKeyboardMarkup()
@@ -1088,7 +1160,8 @@ def _cb(call):
         filter_id = d["filter_id"]
         field     = d["field"]
         sel       = list(d.get("sel", []))
-        opts_map  = {"experience": EXPERIENCE_OPTIONS, "employment": EMPLOYMENT_OPTIONS, "schedule": SCHEDULE_OPTIONS}
+        opts_map  = {"experience": EXPERIENCE_OPTIONS, "employment": EMPLOYMENT_OPTIONS,
+                     "schedule": SCHEDULE_OPTIONS, "work_format": WORK_FORMAT_OPTIONS}
 
         if data == "ems_done":
             db.update_filter(filter_id, **{field: _serialize_multi(sel)})
@@ -1145,62 +1218,27 @@ def _cb(call):
             pass
         return
 
-    # ── AI cover letter flow ──────────────────────────────────────────────────
+    # ── AI cover letter (from a vacancy card) ─────────────────────────────────
 
-    if data.startswith("ai_") and not data.startswith("ai_res_") and not data.startswith("ai_lie_"):
-        # Step 1: user clicked "🤖 ИИ-отклик" under a vacancy card
+    if data.startswith("ai_"):
+        # User clicked "🤖 ИИ-отклик" — generate using saved settings, append below card
         vacancy_id = data[3:]
-
-        # Extract URL from message HTML
-        msg_text = call.message.text or ""
-        msg_html = call.message.html_text if hasattr(call.message, "html_text") else ""
+        msg_html = call.message.html_text if hasattr(call.message, "html_text") else (call.message.text or "")
         url_m = re.search(r'href="(https://[^"]*hh\.ru/vacancy/\d+)', msg_html)
         vacancy_url = url_m.group(1) if url_m else f"https://hh.ru/vacancy/{vacancy_id}"
-
-        _ai_pending[uid] = {
-            "mode":        "vacancy",
-            "cid":         cid,
-            "card_mid":    mid,
-            "prompt_mid":  mid,
-            "card_text":   msg_text,
-            "vacancy_url": vacancy_url,
-            "vacancy_id":  vacancy_id,
-        }
-        _ai_choose_resume_or_generate(uid)
+        _cover_from_card(cid, mid, vacancy_url, vacancy_id, msg_html)
         return
 
-    if data.startswith("ai_res_"):
-        # Step 2: resume selected
-        resume_id = int(data[7:])
-        pending = _ai_pending.get(uid)
-        if not pending:
-            bot.answer_callback_query(call.id, "Устарело, начни заново")
-            return
+    # ── Letter settings ───────────────────────────────────────────────────────
 
-        pending["resume_id"]  = resume_id
-        pending["prompt_mid"] = mid
-
-        if resume_id == 0:
-            _ai_generate(uid)
-        else:
-            r = db.get_resume(resume_id)
-            name = r["name"] if r else "Резюме"
-            _ai_show_kb(uid, kb_ai_lie_level(),
-                        f"✉️ Резюме: «{name}».\nВыбери степень достоверности:")
-            bot.answer_callback_query(call.id, f"Резюме: {name}")
+    if data.startswith("setres_"):
+        db.set_setting("cover_resume_id", data[7:])
+        _show_letter_settings(cid, mid)
         return
 
-    if data.startswith("ai_lie_"):
-        # Step 3: lie level selected → generate
-        lie_level = int(data[7:])
-        pending = _ai_pending.get(uid)
-        if not pending:
-            bot.answer_callback_query(call.id, "Устарело, начни заново")
-            return
-
-        pending["lie_level"]  = lie_level
-        pending["prompt_mid"] = mid
-        _ai_generate(uid)
+    if data.startswith("setlie_"):
+        db.set_setting("cover_lie_level", data[7:])
+        _show_letter_settings(cid, mid)
         return
 
     # ── Resume management callbacks ───────────────────────────────────────────
@@ -1347,150 +1385,76 @@ def _normalize_vacancy_url(raw: str) -> str | None:
     return None
 
 
-def _start_cover_letter(uid: int, cid: int, raw_url: str):
-    """Entry point for standalone cover-letter flow (/p command and menu button)."""
-    url = _normalize_vacancy_url(raw_url)
-    if not url:
-        bot.send_message(
-            cid,
-            "❌ Не похоже на ссылку на вакансию hh.ru.\n"
-            "Пример: <code>https://hh.ru/vacancy/12345678</code>",
-            reply_markup=kb_menu(),
-        )
-        return
+def _build_letter(vacancy_url: str, resume_id: int, lie_level: int) -> str:
+    """Synchronously fetch the vacancy page and produce the cover letter text."""
+    resume_text = None
+    if resume_id:
+        r = db.get_resume(resume_id)
+        resume_text = r["text"] if r else None
 
-    vid_m = re.search(r"/vacancy/(\d+)", url)
-    vacancy_id = vid_m.group(1) if vid_m else url
-
-    host = bot.send_message(cid, "✉️ Готовлю сопроводительное…")
-    _ai_pending[uid] = {
-        "mode":        "standalone",
-        "cid":         cid,
-        "card_mid":    None,
-        "prompt_mid":  host.message_id,
-        "card_text":   "",
-        "vacancy_url": url,
-        "vacancy_id":  vacancy_id,
-    }
-    _ai_choose_resume_or_generate(uid)
+    prompt_template = db.get_setting("groq_prompt") or None
+    page_text = ai.fetch_vacancy_page(vacancy_url)
+    return ai.generate_cover_letter(
+        vacancy_card_text="",
+        vacancy_page_text=page_text,
+        resume_text=resume_text,
+        lie_level=lie_level,
+        prompt_template=prompt_template,
+    )
 
 
-def _ai_show_kb(uid: int, kb, standalone_text: str):
-    """Show a selection keyboard, mode-aware.
-
-    vacancy mode  → edit only the markup of the vacancy card.
-    standalone    → edit text + markup of the host message.
-    """
-    pending = _ai_pending.get(uid)
-    if not pending:
-        return
-    cid  = pending["cid"]
-    pmid = pending["prompt_mid"]
-    try:
-        if pending["mode"] == "standalone":
-            bot.edit_message_text(standalone_text, cid, pmid, reply_markup=kb)
-        else:
-            bot.edit_message_reply_markup(cid, pmid, reply_markup=kb)
-    except Exception:
-        pass
-
-
-def _ai_choose_resume_or_generate(uid: int):
-    """Decide next step: no resume → generate; 1 resume → auto-pick + ask lie;
-    several → ask which resume."""
-    pending = _ai_pending.get(uid)
-    if not pending:
-        return
-
-    resumes = db.get_resumes()
-    if not resumes:
-        pending["resume_id"] = 0
-        _ai_generate(uid)
-        return
-
-    if len(resumes) == 1:
-        pending["resume_id"] = resumes[0]["id"]
-        _ai_show_kb(
-            uid, kb_ai_lie_level(),
-            f"✉️ Резюме: «{resumes[0]['name']}».\nВыбери степень достоверности:",
-        )
-        return
-
-    _ai_show_kb(uid, kb_ai_resume_select(resumes), "✉️ С каким резюме писать?")
-
-
-def _ai_generate(uid: int):
-    """Start background AI generation using data from _ai_pending[uid]."""
-    pending = _ai_pending.pop(uid, None)
-    if not pending:
-        return
-
-    mode        = pending.get("mode", "vacancy")
-    cid         = pending["cid"]
-    card_mid    = pending.get("card_mid")
-    prompt_mid  = pending.get("prompt_mid")
-    card_text   = pending["card_text"]
-    vacancy_url = pending["vacancy_url"]
-    vacancy_id  = pending["vacancy_id"]
-    resume_id   = pending.get("resume_id", 0)
-    lie_level   = pending.get("lie_level", 1)
-
-    # Show spinner
-    try:
-        if mode == "standalone":
-            bot.edit_message_text("⏳ Генерирую сопроводительное…", cid, prompt_mid)
-        else:
-            spinner_kb = InlineKeyboardMarkup()
-            spinner_kb.add(InlineKeyboardButton("⏳ Генерирую отклик...", callback_data="noop"))
-            bot.edit_message_reply_markup(cid, prompt_mid, reply_markup=spinner_kb)
-    except Exception:
-        pass
+def _cover_from_link(cid: int, url: str):
+    """Plain link pasted in chat → reply with ONLY the cover letter (copyable)."""
+    resume_id, lie_level = _resolve_cover_settings()
+    host = bot.send_message(cid, "✉️ Пишу сопроводительное…")
+    mid = host.message_id
 
     def _worker():
-        resume_text = None
-        if resume_id:
-            r = db.get_resume(resume_id)
-            resume_text = r["text"] if r else None
-
-        prompt_template = db.get_setting("groq_prompt") or None
-
-        page_text = ai.fetch_vacancy_page(vacancy_url)
-        result    = ai.generate_cover_letter(
-            vacancy_card_text=card_text,
-            vacancy_page_text=page_text,
-            resume_text=resume_text,
-            lie_level=lie_level,
-            prompt_template=prompt_template,
-        )
-
-        tag = "ИИ-отклик" if mode == "vacancy" else "Сопроводительное"
-        if resume_id and resume_text:
-            r = db.get_resume(resume_id)
-            rname = r["name"] if r else "Резюме"
-            lie_labels = {1: "честно", 2: "немного", 3: "свободно"}
-            header = (f"🤖 <b>{tag}</b>  |  📄 {rname}  |  "
-                      f"уровень {lie_level} ({lie_labels[lie_level]})\n\n")
-        else:
-            header = f"🤖 <b>{tag}</b>  |  без резюме\n\n"
-
-        if mode == "standalone":
-            footer = f"\n\n🔗 {vacancy_url}"
+        letter = _build_letter(url, resume_id, lie_level)
+        safe = html.escape(letter)
+        try:
+            # Only the letter, inside a code block → tap to copy
+            bot.edit_message_text(f"<pre>{safe}</pre>", cid, mid,
+                                  disable_web_page_preview=True)
+        except Exception:
             try:
-                bot.edit_message_text(header + result + footer, cid, prompt_mid,
-                                      disable_web_page_preview=True)
-            except Exception:
-                try:
-                    bot.send_message(cid, header + result + footer,
-                                     disable_web_page_preview=True)
-                except Exception as e:
-                    log.error("Failed to send cover letter: %s", e)
-        else:
-            try:
-                bot.send_message(cid, header + result, reply_to_message_id=card_mid)
+                bot.send_message(cid, f"<pre>{safe}</pre>", disable_web_page_preview=True)
             except Exception as e:
-                log.error("Failed to send AI response: %s", e)
-            # Restore original vacancy buttons
+                log.error("Failed to send cover letter: %s", e)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _cover_from_card(cid: int, card_mid: int, vacancy_url: str,
+                     vacancy_id: str, card_html: str):
+    """ИИ-отклик button → append the letter to the vacancy message in a code block."""
+    resume_id, lie_level = _resolve_cover_settings()
+
+    # Spinner on the button
+    try:
+        spinner = InlineKeyboardMarkup()
+        spinner.add(InlineKeyboardButton("⏳ Генерирую…", callback_data="noop"))
+        bot.edit_message_reply_markup(cid, card_mid, reply_markup=spinner)
+    except Exception:
+        pass
+
+    # Keep only the original card (strip any previously appended letter)
+    base_html = re.split(r"\n\n<pre>", card_html)[0]
+
+    def _worker():
+        letter = _build_letter(vacancy_url, resume_id, lie_level)
+        safe = html.escape(letter)
+        new_html = f"{base_html}\n\n<pre>{safe}</pre>"
+        try:
+            bot.edit_message_text(new_html, cid, card_mid,
+                                  disable_web_page_preview=True,
+                                  reply_markup=kb_vacancy_actions(vacancy_id))
+        except Exception as e:
+            log.error("Failed to append cover letter to card: %s", e)
             try:
+                bot.send_message(cid, f"<pre>{safe}</pre>",
+                                 reply_to_message_id=card_mid,
+                                 disable_web_page_preview=True)
                 bot.edit_message_reply_markup(cid, card_mid,
                                               reply_markup=kb_vacancy_actions(vacancy_id))
             except Exception:
@@ -1550,8 +1514,7 @@ def _run_check():
 
         limited = recent[:MAX_NEW_VACANCIES]
         log.info("Filter '%s': %d new vacancies", f["name"], len(limited))
-        send_vacancies(f["id"], limited,
-                       f"🆕 <b>{f['name']}</b> — {len(limited)} новых вакансий:")
+        send_vacancies(f["id"], limited)
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────

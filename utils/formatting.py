@@ -18,6 +18,11 @@ _SCH = {
     "remote":     "Удалённо",
     "flyInFlyOut":"Вахта",
 }
+_WF = {
+    "ON_SITE": "Офис",
+    "REMOTE":  "Удалёнка",
+    "HYBRID":  "Гибрид",
+}
 
 
 def format_vacancy(v: dict) -> str:
@@ -29,6 +34,7 @@ def format_vacancy(v: dict) -> str:
     sch      = (v.get("schedule") or {}).get("name", "")
     emp_type = (v.get("employment") or {}).get("name", "")
     pub_date = v.get("published_at", "")
+    work_fmt = v.get("work_format", "")
 
     salary = v.get("salary")
     if salary:
@@ -48,6 +54,7 @@ def format_vacancy(v: dict) -> str:
     if exp:      lines.append(f"🎓 {exp}")
     if emp_type: lines.append(f"💼 {emp_type}")
     if sch:      lines.append(f"🕐 {sch}")
+    if work_fmt: lines.append(f"🏠 {work_fmt}")
     if pub_date: lines.append(f"📅 {pub_date}")
     if url:      lines.append(f'\n<a href="{url}">Открыть вакансию ↗</a>')
     return "\n".join(lines)
@@ -73,9 +80,11 @@ def format_filter_info(f: dict) -> str:
     exp = _fmt_multi(f.get("experience"), _EXP)
     emp = _fmt_multi(f.get("employment"), _EMP)
     sch = _fmt_multi(f.get("schedule"),   _SCH)
+    wf  = _fmt_multi(f.get("work_format"), _WF)
     if exp: lines.append(f"🎓 {exp}")
     if emp: lines.append(f"💼 {emp}")
     if sch: lines.append(f"🕐 {sch}")
+    if wf:  lines.append(f"🏠 {wf}")
 
     lines.append("✅ Активен" if f.get("is_active") else "⏸ На паузе")
     return "\n".join(lines)

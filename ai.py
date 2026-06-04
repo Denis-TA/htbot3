@@ -163,6 +163,34 @@ def fetch_vacancy_page(url: str) -> str:
         return ""
 
 
+def fetch_work_format(url: str) -> str:
+    """
+    Best-effort: open hh.ru vacancy page and return a short work-format label
+    like "Удалёнка", "Офис", "Гибрид" (or a combo "Офис/Гибрид").
+    Returns "" if unavailable.
+    """
+    try:
+        r = _get_session().get(url, timeout=12)
+        if r.status_code != 200:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        el = soup.find(attrs={"data-qa": "work-formats-text"})
+        if not el:
+            return ""
+        raw = el.get_text(" ", strip=True).replace("\xa0", " ").lower()
+        labels = []
+        if "удал" in raw:
+            labels.append("Удалёнка")
+        if "гибрид" in raw:
+            labels.append("Гибрид")
+        if "на месте" in raw or "офис" in raw:
+            labels.append("Офис")
+        return "/".join(labels)
+    except Exception as e:
+        log.debug("fetch_work_format failed: %s", e)
+        return ""
+
+
 # ── Groq call ─────────────────────────────────────────────────────────────────
 
 def generate_cover_letter(

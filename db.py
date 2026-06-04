@@ -78,6 +78,7 @@ _SQLITE_SCHEMA = """
         experience       TEXT,
         employment       TEXT,
         schedule         TEXT,
+        work_format      TEXT,
         is_active        INTEGER DEFAULT 1,
         created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -111,6 +112,7 @@ _PG_SCHEMA = [
         experience       TEXT,
         employment       TEXT,
         schedule         TEXT,
+        work_format      TEXT,
         is_active        INTEGER DEFAULT 1,
         created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""",
@@ -140,19 +142,44 @@ def init_db():
                 cur.execute(stmt)
         else:
             conn._c.executescript(_SQLITE_SCHEMA)
+    _migrate()
+
+
+def _migrate():
+    """Idempotent, non-destructive migrations for existing databases.
+
+    Only ADDs columns — never drops or recreates — so existing resumes,
+    filters, progress, seen vacancies and settings are preserved.
+    """
+    _safe_add_column("filters", "work_format", "TEXT")
+
+
+def _safe_add_column(table: str, column: str, decl: str):
+    with get_conn() as conn:
+        if _PG:
+            # PostgreSQL supports IF NOT EXISTS natively
+            conn._c.cursor().execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {decl}"
+            )
+        else:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
 
 def create_filter(name, text=None, area_id=None, area_name=None,
                   salary_from=None, salary_to=None, only_with_salary=False,
-                  experience=None, employment=None, schedule=None):
+                  experience=None, employment=None, schedule=None,
+                  work_format=None):
     sql = """INSERT INTO filters
                (name,text,area_id,area_name,salary_from,salary_to,
-                only_with_salary,experience,employment,schedule)
-               VALUES (?,?,?,?,?,?,?,?,?,?)"""
+                only_with_salary,experience,employment,schedule,work_format)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)"""
     params = (name, text, area_id, area_name, salary_from, salary_to,
-              1 if only_with_salary else 0, experience, employment, schedule)
+              1 if only_with_salary else 0, experience, employment, schedule,
+              work_format)
     with get_conn() as conn:
         return conn._insert_id(sql, params)
 
