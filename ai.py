@@ -24,6 +24,24 @@ class GroqError(Exception):
     """Raised when Groq cannot be reached or returns a non-recoverable error."""
 
 
+# Optional callback to notify the user when keys are rotated. Set by bot.py.
+_notifier = None
+
+
+def set_notifier(fn):
+    """Register a callable fn(text) used to push status messages to the user."""
+    global _notifier
+    _notifier = fn
+
+
+def _notify(text: str):
+    if _notifier:
+        try:
+            _notifier(text)
+        except Exception as e:
+            log.debug("notifier failed: %s", e)
+
+
 def _groq_chat(payload: dict, timeout: int = 30) -> str:
     """
     Call Groq chat completions, rotating through all configured API keys.
@@ -66,6 +84,9 @@ def _groq_chat(payload: dict, timeout: int = 30) -> str:
                 last_err = f"429 rate limit on key #{idx}"
                 log.warning("Groq key #%d hit 429 — rotating to next key", idx)
                 rate_limited = True
+                if idx < len(GROQ_API_KEYS):
+                    _notify(f"⚠️ Ключ Groq #{idx} исчерпан (429). "
+                            f"Переключаюсь на ключ #{idx + 1}…")
                 break  # stop trying routes, move to next key
 
             # Other HTTP error — log and try next route/key

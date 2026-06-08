@@ -39,6 +39,17 @@ if TELEGRAM_PROXY:
     log.info("Telegram proxy: %s", TELEGRAM_PROXY)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+
+def _notify_owner(text: str):
+    """Push a status message to the owner (used by ai.py for key rotation)."""
+    try:
+        bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        log.warning("notify_owner failed: %s", e)
+
+
+ai.set_notifier(_notify_owner)
+
 # ── Состояния диалога ─────────────────────────────────────────────────────────
 user_state: dict = {}
 
@@ -464,7 +475,7 @@ def cmd_start(msg):
         return
     state_clear(msg.from_user.id)
     bot.send_message(msg.chat.id,
-        "👋 Привет! Слежу за вакансиями на hh.ru.",
+        "Привет!",
         reply_markup=kb_menu()
     )
 
