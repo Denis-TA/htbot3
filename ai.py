@@ -6,7 +6,7 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 
-from config import GROQ_API_KEY, TELEGRAM_PROXY
+from config import GROQ_API_KEYS, TELEGRAM_PROXY
 
 _PROXIES = {"http": TELEGRAM_PROXY, "https": TELEGRAM_PROXY} if TELEGRAM_PROXY else {}
 
@@ -16,6 +16,67 @@ GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 _session: requests.Session | None = None
+
+
+# ── Groq HTTP with multi-key rotation ──────────────────────────────────────────
+
+class GroqError(Exception):
+    """Raised when Groq cannot be reached or returns a non-recoverable error."""
+
+
+def _groq_chat(payload: dict, timeout: int = 30) -> str:
+    """
+    Call Groq chat completions, rotating through all configured API keys.
+
+    On HTTP 429 (rate limit) for a key, switch to the next key.
+    For each key, try the proxy route first, then a direct connection.
+    Returns the assistant message text, or raises GroqError.
+    """
+    if not GROQ_API_KEYS:
+        raise GroqError("GROQ_API_KEY не задан в .env / переменных Railway")
+
+    routes = [("proxy", _PROXIES), ("direct", {})]
+    last_err = "unknown"
+
+    for idx, key in enumerate(GROQ_API_KEYS, start=1):
+        rate_limited = False
+        for label, proxies in routes:
+            try:
+                r = requests.post(
+                    GROQ_URL,
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type":  "application/json",
+                    },
+                    json=payload,
+                    proxies=proxies,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                last_err = f"connection ({label}): {e}"
+                log.warning("Groq key #%d %s connection failed: %s", idx, label, e)
+                continue  # try next route
+
+            if r.status_code == 200:
+                if idx > 1:
+                    log.info("Groq: succeeded on key #%d", idx)
+                return r.json()["choices"][0]["message"]["content"].strip()
+
+            if r.status_code == 429:
+                last_err = f"429 rate limit on key #{idx}"
+                log.warning("Groq key #%d hit 429 — rotating to next key", idx)
+                rate_limited = True
+                break  # stop trying routes, move to next key
+
+            # Other HTTP error — log and try next route/key
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            log.error("Groq key #%d %s error %s: %s", idx, label, r.status_code, r.text[:200])
+
+        if not rate_limited:
+            # Non-429 failure exhausted both routes for this key; try next key anyway
+            continue
+
+    raise GroqError(last_err)
 
 # ── Default prompt template ───────────────────────────────────────────────────
 # Placeholders: {VACANCY_CARD}, {VACANCY_DESC}, {RESUME_BLOCK}, {LIE_BLOCK}
@@ -62,9 +123,6 @@ def suggest_keywords(topic: str) -> str:
     Ask Groq to suggest hh.ru search keywords for the given job topic.
     Returns a comma-separated string of keyword groups, or error message.
     """
-    if not GROQ_API_KEY:
-        return "❌ GROQ_API_KEY не задан в .env"
-
     prompt = (
         f"Ты помогаешь с поиском работы на hh.ru.\n\n"
         f"Для поиска вакансий по теме «{topic}» предложи 5–8 вариантов "
@@ -79,27 +137,11 @@ def suggest_keywords(topic: str) -> str:
         "max_tokens":  200,
         "temperature": 0.5,
     }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type":  "application/json",
-    }
-
-    attempts = [("proxy", _PROXIES), ("direct", {})]
-    last_err: Exception | None = None
-
-    for label, proxies in attempts:
-        try:
-            r = requests.post(GROQ_URL, headers=headers, json=payload,
-                              proxies=proxies, timeout=20)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
-            else:
-                return f"❌ Groq API error {r.status_code}"
-        except Exception as e:
-            log.warning("suggest_keywords %s failed: %s", label, e)
-            last_err = e
-
-    return f"❌ Не удалось подключиться к Groq: {last_err}"
+    try:
+        return _groq_chat(payload, timeout=20)
+    except GroqError as e:
+        log.error("suggest_keywords failed: %s", e)
+        return f"❌ Не удалось получить ответ от Groq: {e}"
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
@@ -210,9 +252,6 @@ def generate_cover_letter(
         lie_level:          1 = honest, 2 = slight embellishment, 3 = creative
         prompt_template:    custom template with placeholders; uses DEFAULT if None
     """
-    if not GROQ_API_KEY:
-        return "❌ GROQ_API_KEY не задан в .env"
-
     description = vacancy_page_text or "(не удалось загрузить страницу вакансии)"
     template    = prompt_template or DEFAULT_PROMPT_TEMPLATE
 
@@ -240,33 +279,14 @@ def generate_cover_letter(
         "max_tokens":  700,
         "temperature": 0.7,
     }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type":  "application/json",
-    }
-
-    # Try with proxy first, then direct
-    attempts = [("proxy", _PROXIES), ("direct", {})]
-    last_err: Exception | None = None
-
-    for label, proxies in attempts:
-        try:
-            log.info("Groq: trying %s route…", label)
-            r = requests.post(GROQ_URL, headers=headers, json=payload,
-                              proxies=proxies, timeout=30)
-            if r.status_code == 200:
-                text = r.json()["choices"][0]["message"]["content"].strip()
-                log.info("Groq response via %s: %d chars", label, len(text))
-                return text
-            else:
-                log.error("Groq API %s (%s): %s", r.status_code, label, r.text[:300])
-                return f"❌ Groq API error {r.status_code}"
-        except Exception as e:
-            log.warning("Groq %s attempt failed: %s", label, e)
-            last_err = e
-
-    log.error("Groq: all routes failed. Last error: %s", last_err)
-    return (
-        "❌ Не удалось подключиться к Groq API.\n"
-        "Добавь api.groq.com в правила прокси или проверь VPN."
-    )
+    try:
+        text = _groq_chat(payload, timeout=30)
+        log.info("Groq response: %d chars", len(text))
+        return text
+    except GroqError as e:
+        log.error("Groq failed: %s", e)
+        return (
+            "❌ Не удалось получить ответ от Groq.\n"
+            f"({e})\n"
+            "Если это 429 на всех ключах — лимиты исчерпаны, попробуй позже."
+        )

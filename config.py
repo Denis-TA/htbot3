@@ -23,8 +23,27 @@ APPLY_GOAL = 1000
 HH_CLIENT_ID     = os.getenv("HH_CLIENT_ID", "")
 HH_CLIENT_SECRET = os.getenv("HH_CLIENT_SECRET", "")
 
-# Groq AI
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# Groq AI — up to 5 keys for round-robin on rate limits (429).
+# Railway requires every referenced var to exist, so a key set to "123"
+# is treated as a placeholder and ignored.
+def _collect_groq_keys() -> list:
+    raw = [
+        os.getenv("GROQ_API_KEY", ""),
+        os.getenv("GROQ_API_KEY_2", ""),
+        os.getenv("GROQ_API_KEY_3", ""),
+        os.getenv("GROQ_API_KEY_4", ""),
+        os.getenv("GROQ_API_KEY_5", ""),
+    ]
+    keys = []
+    for k in raw:
+        k = (k or "").strip()
+        if k and k != "123":          # "123" = Railway placeholder
+            keys.append(k)
+    return keys
+
+GROQ_API_KEYS = _collect_groq_keys()
+# Backwards-compat: first valid key (or empty)
+GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
 
 # Прокси для Telegram (задаётся в .env; на сервере оставить пустым)
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")
