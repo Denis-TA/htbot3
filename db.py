@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 
 from config import DB_PATH
@@ -87,6 +88,15 @@ _SQLITE_SCHEMA = """
         filter_id  INTEGER NOT NULL,
         PRIMARY KEY (vacancy_id, filter_id)
     );
+    CREATE TABLE IF NOT EXISTS sent_vacancies (
+        vacancy_id TEXT PRIMARY KEY,
+        sent_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS blocked_employers (
+        name_norm  TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS settings (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -121,6 +131,15 @@ _PG_SCHEMA = [
         filter_id  INTEGER NOT NULL,
         PRIMARY KEY (vacancy_id, filter_id)
     )""",
+    """CREATE TABLE IF NOT EXISTS sent_vacancies (
+        vacancy_id TEXT PRIMARY KEY,
+        sent_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
+    """CREATE TABLE IF NOT EXISTS blocked_employers (
+        name_norm  TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
     """CREATE TABLE IF NOT EXISTS settings (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -149,7 +168,7 @@ def _migrate():
     """Idempotent, non-destructive migrations for existing databases.
 
     Only ADDs columns — never drops or recreates — so existing resumes,
-    filters, progress, seen vacancies and settings are preserved.
+    filters, seen vacancies and settings are preserved.
     """
     _safe_add_column("filters", "work_format", "TEXT")
 
@@ -257,6 +276,85 @@ def mark_seen(filter_id, vacancy_ids):
         conn.executemany(sql, [(vid, filter_id) for vid in vacancy_ids])
 
 
+# ── Global delivery log ───────────────────────────────────────────────────────
+# seen_vacancies is keyed per filter, so a vacancy matching two filters counts
+# as new for each of them. sent_vacancies tracks what actually reached the chat,
+# regardless of which filter found it — this is what prevents duplicates.
+
+def get_sent(vacancy_ids) -> set:
+    """Return the subset of vacancy_ids already delivered to the user."""
+    ids = list(vacancy_ids)
+    if not ids:
+        return set()
+    placeholders = ",".join("?" * len(ids))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT vacancy_id FROM sent_vacancies WHERE vacancy_id IN ({placeholders})",
+            ids
+        ).fetchall()
+    return {r["vacancy_id"] if _PG else r[0] for r in rows}
+
+
+def mark_sent(vacancy_ids):
+    if not vacancy_ids:
+        return
+    if _PG:
+        sql = "INSERT INTO sent_vacancies (vacancy_id) VALUES (?) ON CONFLICT DO NOTHING"
+    else:
+        sql = "INSERT OR IGNORE INTO sent_vacancies (vacancy_id) VALUES (?)"
+    with get_conn() as conn:
+        conn.executemany(sql, [(vid,) for vid in vacancy_ids])
+
+
+# ── Blocked employers ─────────────────────────────────────────────────────────
+
+def norm_employer(name: str) -> str:
+    """Normalize a company name for matching: case, quotes and spacing only.
+
+    Deliberately conservative — no stripping of ООО/АО/etc., since that would
+    collapse genuinely different companies onto one another.
+    """
+    s = (name or "").strip().lower()
+    s = s.replace("«", '"').replace("»", '"').replace("“", '"').replace("”", '"')
+    s = s.replace("ё", "е")
+    s = re.sub(r"[\"'`]", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def block_employer(name: str) -> bool:
+    """Add a company to the block list. Returns False if it was already there."""
+    norm = norm_employer(name)
+    if not norm:
+        return False
+    if _PG:
+        sql = "INSERT INTO blocked_employers (name_norm,name) VALUES (?,?) ON CONFLICT DO NOTHING"
+    else:
+        sql = "INSERT OR IGNORE INTO blocked_employers (name_norm,name) VALUES (?,?)"
+    with get_conn() as conn:
+        cur = conn.execute(sql, (norm, name.strip()))
+        return cur.rowcount > 0
+
+
+def unblock_employer(name_norm: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM blocked_employers WHERE name_norm=?", (name_norm,))
+
+
+def get_blocked_employers() -> list:
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM blocked_employers ORDER BY name"
+        ).fetchall()]
+
+
+def get_blocked_norms() -> set:
+    """All blocked names, normalized — for filtering a batch of vacancies."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT name_norm FROM blocked_employers").fetchall()
+    return {r["name_norm"] if _PG else r[0] for r in rows}
+
+
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 def get_setting(key: str, default: str = "") -> str:
@@ -279,55 +377,44 @@ def del_setting(key: str):
         conn.execute("DELETE FROM settings WHERE key=?", (key,))
 
 
-# ── Progress ──────────────────────────────────────────────────────────────────
-
-def get_progress() -> int:
-    return int(get_setting("applied_count", "0"))
-
-
-def set_progress(value: int):
-    set_setting("applied_count", str(max(0, value)))
-
-
-def inc_progress() -> int:
-    current = get_progress()
-    new_val = current + 1
-    set_progress(new_val)
-    return new_val
-
-
 # ── Resumes ───────────────────────────────────────────────────────────────────
 
-def add_resume(name: str, text: str) -> int:
-    sql = "INSERT INTO resumes (name, text) VALUES (?, ?)"
+# The bot keeps exactly one resume. The table can still hold older rows from
+# when several were supported — the newest is the one in use.
+
+RESUME_NAME = "Моё резюме"
+
+
+def get_resume() -> dict | None:
+    """The single resume in use, or None if none has been saved yet.
+
+    id breaks created_at ties, so rows written in the same second still
+    resolve to one stable winner.
+    """
     with get_conn() as conn:
-        return conn._insert_id(sql, (name, text))
-
-
-def get_resumes() -> list:
-    with get_conn() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM resumes ORDER BY created_at DESC"
-        ).fetchall()]
-
-
-def get_resume(resume_id: int) -> dict | None:
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM resumes WHERE id=?", (resume_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM resumes ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
         return dict(row) if row else None
 
 
-def update_resume(resume_id: int, **kwargs):
-    if not kwargs:
-        return
-    set_clause = ", ".join(f"{k}=?" for k in kwargs)
-    with get_conn() as conn:
-        conn.execute(
-            f"UPDATE resumes SET {set_clause} WHERE id=?",
-            list(kwargs.values()) + [resume_id]
-        )
+def get_resume_text() -> str:
+    r = get_resume()
+    return r["text"] if r else ""
 
 
-def delete_resume(resume_id: int):
+def save_resume(text: str):
+    """Overwrite the resume, creating it on first use."""
+    current = get_resume()
     with get_conn() as conn:
-        conn.execute("DELETE FROM resumes WHERE id=?", (resume_id,))
+        if current:
+            conn.execute("UPDATE resumes SET text=? WHERE id=?", (text, current["id"]))
+        else:
+            conn.execute("INSERT INTO resumes (name, text) VALUES (?, ?)",
+                         (RESUME_NAME, text))
+
+
+def delete_resume():
+    """Remove every stored resume."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM resumes")

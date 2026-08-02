@@ -100,7 +100,12 @@ def _groq_chat(payload: dict, timeout: int = 30) -> str:
     raise GroqError(last_err)
 
 # ── Default prompt template ───────────────────────────────────────────────────
-# Placeholders: {VACANCY_CARD}, {VACANCY_DESC}, {RESUME_BLOCK}, {LIE_BLOCK}
+# Placeholders: {VACANCY_CARD}, {VACANCY_DESC}, {RESUME_BLOCK}
+
+HONESTY_RULE = (
+    "Пиши СТРОГО по резюме: используй только тот опыт и навыки, которые в нём есть. "
+    "Не выдумывай и не приукрашивай — ничего, чего нет в резюме."
+)
 
 DEFAULT_PROMPT_TEMPLATE = """\
 Ты помогаешь кандидату написать отклик на вакансию с hh.ru.
@@ -121,20 +126,7 @@ DEFAULT_PROMPT_TEMPLATE = """\
 - Покажи что внимательно прочитал требования — упомяни 2-3 конкретных пункта из описания
 - Не используй шаблонные фразы: "я ответственный", "быстро обучаюсь", "работаю в команде"
 - Только текст письма, без заголовков и пояснений
-
-{LIE_BLOCK}"""
-
-LIE_INSTRUCTIONS = {
-    1: ("Уровень честности 1 — СТРОГО по резюме: "
-        "используй только то, что написано в резюме. "
-        "Не добавляй навыки или опыт, которых нет."),
-    2: ("Уровень честности 2 — НЕМНОГО приукрасить: "
-        "можно слегка преувеличить достижения, добавить смежные навыки которые логично вытекают из указанных. "
-        "Не придумывай принципиально новый опыт."),
-    3: ("Уровень честности 3 — СВОБОДНО дополнять: "
-        "можно добавлять опыт, навыки и достижения которых нет в резюме, если они релевантны вакансии. "
-        "Главное — убедительность письма."),
-}
+- Строго по резюме: не приписывай опыт и навыки, которых в нём нет"""
 
 
 # ── Keyword suggester ────────────────────────────────────────────────────────
@@ -260,36 +252,32 @@ def generate_cover_letter(
     vacancy_card_text: str,
     vacancy_page_text: str,
     resume_text: str | None = None,
-    lie_level: int = 1,
     prompt_template: str | None = None,
 ) -> str:
     """
-    Call Groq and return a cover letter.
+    Call Groq and return a cover letter, written strictly from the resume.
 
     Args:
         vacancy_card_text:  formatted text from Telegram message (title, company, salary)
         vacancy_page_text:  full description scraped from hh.ru
         resume_text:        candidate resume, optional
-        lie_level:          1 = honest, 2 = slight embellishment, 3 = creative
         prompt_template:    custom template with placeholders; uses DEFAULT if None
     """
     description = vacancy_page_text or "(не удалось загрузить страницу вакансии)"
     template    = prompt_template or DEFAULT_PROMPT_TEMPLATE
 
-    # Build blocks
     if resume_text and resume_text.strip():
         resume_block = f"=== Моё резюме ===\n{resume_text.strip()}"
-        lie_block    = LIE_INSTRUCTIONS.get(lie_level, "")
     else:
         resume_block = ""
-        lie_block    = ""
 
     try:
         prompt = template.format(
             VACANCY_CARD=vacancy_card_text,
             VACANCY_DESC=description,
             RESUME_BLOCK=resume_block,
-            LIE_BLOCK=lie_block,
+            # Kept so prompts saved back when lie levels existed still render.
+            LIE_BLOCK=HONESTY_RULE if resume_block else "",
         )
     except KeyError as e:
         return f"❌ Ошибка в шаблоне промпта: неизвестный плейсхолдер {e}"

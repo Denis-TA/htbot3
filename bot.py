@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import html
 import logging
 import os
@@ -16,8 +17,7 @@ import db
 import hh_api
 from ai import DEFAULT_PROMPT_TEMPLATE
 from config import (BOT_TOKEN, OWNER_ID, CHECK_INTERVAL_SECONDS,
-                    INITIAL_VACANCIES_COUNT, MAX_NEW_VACANCIES, TELEGRAM_PROXY,
-                    APPLIED_GROUP_ID, APPLY_GOAL)
+                    INITIAL_VACANCIES_COUNT, MAX_NEW_VACANCIES, TELEGRAM_PROXY)
 from utils.formatting import format_vacancy, format_filter_info
 
 _log_fmt  = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
@@ -78,24 +78,19 @@ WORK_FORMAT_OPTIONS = [
     ("Гибрид",   "HYBRID"),
 ]
 
-LIE_LABELS = {1: "строго по тексту", 2: "с дополнениями", 3: "свободно"}
-
-
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
-BTN_FILTERS  = "📋 Мои фильтры"
-BTN_CREATE   = "➕ Создать фильтр"
-BTN_PROGRESS = "📊 Прогресс"
-BTN_RESUMES  = "📄 Резюме"
-BTN_PROMPT   = "⚙️ Промпт ИИ"
-BTN_LETTER   = "✉️ Настройки письма"
+BTN_FILTERS = "📋 Мои фильтры"
+BTN_CREATE  = "➕ Создать фильтр"
+BTN_RESUME  = "✏️ Редактировать резюме"
+BTN_PROMPT  = "⚙️ Промпт ИИ"
 
 
 def kb_menu():
     m = ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(KeyboardButton(BTN_FILTERS), KeyboardButton(BTN_CREATE))
-    m.row(KeyboardButton(BTN_PROGRESS), KeyboardButton(BTN_RESUMES))
-    m.row(KeyboardButton(BTN_LETTER), KeyboardButton(BTN_PROMPT))
+    m.row(KeyboardButton(BTN_RESUME))
+    m.row(KeyboardButton(BTN_PROMPT))
     return m
 
 
@@ -174,49 +169,36 @@ def kb_edit_menu():
 
 def kb_vacancy_actions(vacancy_id: str) -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup()
-    m.row(
-        InlineKeyboardButton("✅ Откликнулся", callback_data=f"appl_{vacancy_id}"),
-        InlineKeyboardButton("🙈 Скрыть",      callback_data=f"hide_{vacancy_id}"),
-    )
     m.add(InlineKeyboardButton("🤖 ИИ-отклик", callback_data=f"ai_{vacancy_id}"))
+    m.add(InlineKeyboardButton("🚫 Скрыть все вакансии компании",
+                               callback_data=f"blk_{vacancy_id}"))
     return m
 
 
-def kb_resume_list(resumes: list) -> InlineKeyboardMarkup:
+def _emp_token(name_norm: str) -> str:
+    """Short stable id for a company name.
+
+    callback_data caps at 64 bytes and Cyrillic costs 2 bytes per char, so the
+    name itself will not fit — we send a hash and resolve it back on click.
+    """
+    return hashlib.md5(name_norm.encode("utf-8")).hexdigest()[:16]
+
+
+def kb_blocked_list(blocked: list) -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup()
-    for r in resumes:
-        preview = r["name"]
-        m.add(InlineKeyboardButton(f"📄 {preview}", callback_data=f"res_open_{r['id']}"))
-    m.add(InlineKeyboardButton("➕ Добавить резюме", callback_data="res_add"))
+    for b in blocked:
+        label = b["name"] if len(b["name"]) <= 38 else b["name"][:37] + "…"
+        m.add(InlineKeyboardButton(f"✖️ {label}",
+                                   callback_data=f"unblk_{_emp_token(b['name_norm'])}"))
     return m
 
 
-def kb_resume_actions(resume_id: int) -> InlineKeyboardMarkup:
+def kb_resume_actions(has_resume: bool) -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup()
-    m.row(
-        InlineKeyboardButton("✏️ Название",  callback_data=f"res_edit_name_{resume_id}"),
-        InlineKeyboardButton("📝 Текст",     callback_data=f"res_edit_text_{resume_id}"),
-    )
-    m.add(InlineKeyboardButton("🗑 Удалить", callback_data=f"res_del_{resume_id}"))
-    m.add(InlineKeyboardButton("« Назад",   callback_data="res_list"))
-    return m
-
-
-def kb_letter_settings(resumes: list, cur_resume_id: int, cur_lie: int) -> InlineKeyboardMarkup:
-    """Settings menu: pick default resume + lie level for cover letters."""
-    m = InlineKeyboardMarkup()
-    # Resume choices
-    for r in resumes:
-        mark = "🔘" if r["id"] == cur_resume_id else "⚪"
-        m.add(InlineKeyboardButton(f"{mark} 📄 {r['name']}", callback_data=f"setres_{r['id']}"))
-    none_mark = "🔘" if cur_resume_id == 0 else "⚪"
-    m.add(InlineKeyboardButton(f"{none_mark} 🚫 Без резюме", callback_data="setres_0"))
-    # Lie level
-    m.row(
-        InlineKeyboardButton(("🔘" if cur_lie == 1 else "⚪") + " 1 строго", callback_data="setlie_1"),
-        InlineKeyboardButton(("🔘" if cur_lie == 2 else "⚪") + " 2 чуть",   callback_data="setlie_2"),
-        InlineKeyboardButton(("🔘" if cur_lie == 3 else "⚪") + " 3 свободно", callback_data="setlie_3"),
-    )
+    label = "✏️ Изменить текст" if has_resume else "➕ Добавить резюме"
+    m.add(InlineKeyboardButton(label, callback_data="res_edit"))
+    if has_resume:
+        m.add(InlineKeyboardButton("🗑 Удалить", callback_data="res_del"))
     return m
 
 
@@ -258,8 +240,67 @@ def _enrich_work_format(vacancies):
         log.debug("work_format enrich failed: %s", e)
 
 
+def _employer_of(v: dict) -> str:
+    return (v.get("employer") or {}).get("name", "")
+
+
+def _employer_from_card(card_html: str) -> str:
+    """Pull the company name back out of a sent vacancy card.
+
+    format_vacancy renders it as a '🏢 <name>' line. Anything after the card
+    (an appended AI letter) is ignored so its text can't be mistaken for a name.
+    """
+    base = re.split(r"\n\n<pre>", card_html or "")[0]
+    m = re.search(r"^🏢\s*(.+)$", base, re.MULTILINE)
+    return html.unescape(m.group(1).strip()) if m else ""
+
+
+def _dedupe(vacancies):
+    """Pick what to actually send: no repeats, nothing already sent, no blocked employers.
+
+    Returns (sendable, skip_ids). seen_vacancies is per-filter, so a vacancy
+    matching two filters would otherwise be sent once per filter — the global
+    sent-log is the real guard. skip_ids still get marked seen so the checker
+    stops re-examining them.
+    """
+    unique, batch_ids = [], set()
+    for v in vacancies:
+        vid = v["id"]
+        if vid in batch_ids:
+            continue
+        batch_ids.add(vid)
+        unique.append(v)
+
+    already = db.get_sent(batch_ids)
+    blocked = db.get_blocked_norms()
+
+    sendable, skip_ids = [], set(already)
+    for v in unique:
+        if v["id"] in already:
+            continue
+        if blocked and db.norm_employer(_employer_of(v)) in blocked:
+            skip_ids.add(v["id"])
+            log.info("Blocked employer, skipping %s (%s)", v["id"], _employer_of(v))
+            continue
+        sendable.append(v)
+
+    skipped = len(vacancies) - len(sendable)
+    if skipped:
+        log.info("Filtered out %d vacancies (duplicate / already sent / blocked)", skipped)
+    return sendable, skip_ids
+
+
 def send_vacancies(filter_id, vacancies, header=None):
     """Send vacancy cards to the owner. No noisy header unless explicitly given."""
+    vacancies, skip_ids = _dedupe(vacancies)
+
+    # Skipped ones still count as seen for this filter, so we stop re-checking them.
+    if skip_ids:
+        db.mark_seen(filter_id, list(skip_ids))
+
+    if not vacancies:
+        return
+
     if header:
         try:
             bot.send_message(OWNER_ID, header)
@@ -268,7 +309,6 @@ def send_vacancies(filter_id, vacancies, header=None):
 
     _enrich_work_format(vacancies)
 
-    sent_ids = []
     for v in vacancies:
         try:
             bot.send_message(
@@ -277,12 +317,12 @@ def send_vacancies(filter_id, vacancies, header=None):
                 disable_web_page_preview=True,
                 reply_markup=kb_vacancy_actions(v["id"]),
             )
-            sent_ids.append(v["id"])
         except Exception as e:
             log.error("Failed to send vacancy %s: %s", v.get("id"), e)
-
-    if sent_ids:
-        db.mark_seen(filter_id, sent_ids)
+            continue
+        # Record per vacancy, not per batch: a crash mid-batch must not resend.
+        db.mark_sent([v["id"]])
+        db.mark_seen(filter_id, [v["id"]])
 
 
 def state_clear(uid):
@@ -318,15 +358,23 @@ def _decode_file(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _show_resumes(cid: int):
-    resumes = db.get_resumes()
-    if not resumes:
-        m = InlineKeyboardMarkup()
-        m.add(InlineKeyboardButton("➕ Добавить резюме", callback_data="res_add"))
-        bot.send_message(cid, "📄 <b>Резюме</b>\n\nРезюме ещё нет.", reply_markup=m)
-        return
-    bot.send_message(cid, f"📄 <b>Резюме</b> ({len(resumes)} шт.):",
-                     reply_markup=kb_resume_list(resumes))
+def _show_resume(cid: int, mid: int = None):
+    r = db.get_resume()
+    if r:
+        preview = r["text"][:1500] + "\n…(обрезано)" if len(r["text"]) > 1500 else r["text"]
+        text = (f"📄 <b>Моё резюме</b> ({len(r['text'])} символов)\n\n"
+                f"<code>{html.escape(preview)}</code>")
+    else:
+        text = ("📄 <b>Моё резюме</b>\n\nРезюме ещё не добавлено.\n"
+                "Оно используется для сопроводительных писем.")
+    kb = kb_resume_actions(bool(r))
+    if mid:
+        try:
+            bot.edit_message_text(text, cid, mid, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    bot.send_message(cid, text, reply_markup=kb)
 
 
 def _show_prompt_menu(cid: int):
@@ -345,8 +393,7 @@ def _show_prompt_menu(cid: int):
         f"<b>Плейсхолдеры:</b>\n"
         f"<code>{{VACANCY_CARD}}</code> — карточка вакансии\n"
         f"<code>{{VACANCY_DESC}}</code> — описание со страницы\n"
-        f"<code>{{RESUME_BLOCK}}</code> — резюме (авто, если выбрано)\n"
-        f"<code>{{LIE_BLOCK}}</code> — уровень вранья (авто)"
+        f"<code>{{RESUME_BLOCK}}</code> — резюме (подставляется само)"
     )
     m = InlineKeyboardMarkup()
     m.add(InlineKeyboardButton("✏️ Изменить текстом",    callback_data="prom_edit_text"))
@@ -356,101 +403,6 @@ def _show_prompt_menu(cid: int):
     else:
         m.add(InlineKeyboardButton("📋 Установить стандартный как основу", callback_data="prom_load_default"))
     bot.send_message(cid, text, reply_markup=m)
-
-
-def _resolve_cover_settings():
-    """Return (resume_id, lie_level) from saved settings, with smart defaults.
-
-    resume_id: explicit setting wins; '0' = no resume; otherwise auto —
-    single resume → that one, several → most recent, none → 0.
-    """
-    lie = db.get_setting("cover_lie_level", "1")
-    lie = int(lie) if lie.isdigit() and int(lie) in (1, 2, 3) else 1
-
-    raw = db.get_setting("cover_resume_id", "")
-    resumes = db.get_resumes()
-    if raw == "0":
-        return 0, lie
-    if raw.isdigit() and db.get_resume(int(raw)):
-        return int(raw), lie
-    # auto
-    if len(resumes) >= 1:
-        return resumes[0]["id"], lie   # most recent
-    return 0, lie
-
-
-def _show_letter_settings(cid: int, mid: int = None):
-    resume_id, lie = _resolve_cover_settings()
-    resumes = db.get_resumes()
-
-    if resume_id and db.get_resume(resume_id):
-        rname = db.get_resume(resume_id)["name"]
-    else:
-        rname = "без резюме"
-
-    raw = db.get_setting("cover_resume_id", "")
-    auto_note = "" if (raw == "0" or raw.isdigit()) else "  (авто)"
-
-    text = (
-        "✉️ <b>Настройки сопроводительного письма</b>\n\n"
-        f"📄 Резюме: <b>{rname}</b>{auto_note}\n"
-        f"🎚 Достоверность: <b>{lie} — {LIE_LABELS[lie]}</b>\n\n"
-        "Теперь просто <b>пришли ссылку</b> на вакансию hh.ru в чат — "
-        "и получишь готовое письмо с этими настройками.\n\n"
-        "Уровни достоверности:\n"
-        "1 — только то, что есть в резюме\n"
-        "2 — немного дополнить смежным\n"
-        "3 — свободно дописывать опыт"
-    )
-    kb = kb_letter_settings(resumes, resume_id if (raw == "0" or raw.isdigit()) else -1, lie)
-    if mid:
-        try:
-            bot.edit_message_text(text, cid, mid, reply_markup=kb)
-            return
-        except Exception:
-            pass
-    bot.send_message(cid, text, reply_markup=kb)
-
-
-def _show_progress_menu(cid: int):
-    count = db.get_progress()
-    pct   = count / APPLY_GOAL * 100
-    filled = min(int(pct / 10), 10)
-    bar   = "█" * filled + " " * (10 - filled)
-    text  = (
-        f"📊 <b>Прогресс откликов</b>\n\n"
-        f"{count} / {APPLY_GOAL}\n"
-        f"|{bar}| {pct:.0f}%"
-    )
-    m = InlineKeyboardMarkup()
-    m.row(
-        InlineKeyboardButton("➕ +1",      callback_data="prog_inc"),
-        InlineKeyboardButton("🔄 Сбросить", callback_data="prog_reset"),
-    )
-    m.add(InlineKeyboardButton("✏️ Ввести значение", callback_data="prog_set"))
-    bot.send_message(cid, text, reply_markup=m)
-
-
-def _show_progress_edit(cid: int, mid: int):
-    count = db.get_progress()
-    pct   = count / APPLY_GOAL * 100
-    filled = min(int(pct / 10), 10)
-    bar   = "█" * filled + " " * (10 - filled)
-    text  = (
-        f"📊 <b>Прогресс откликов</b>\n\n"
-        f"{count} / {APPLY_GOAL}\n"
-        f"|{bar}| {pct:.0f}%"
-    )
-    m = InlineKeyboardMarkup()
-    m.row(
-        InlineKeyboardButton("➕ +1",       callback_data="prog_inc"),
-        InlineKeyboardButton("🔄 Сбросить", callback_data="prog_reset"),
-    )
-    m.add(InlineKeyboardButton("✏️ Ввести значение", callback_data="prog_set"))
-    try:
-        bot.edit_message_text(text, cid, mid, reply_markup=m)
-    except Exception:
-        pass
 
 
 def _start_create(uid: int, cid: int):
@@ -469,15 +421,49 @@ def _show_filters(cid: int):
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+GREETING = """\
+👋 <b>Привет! Я слежу за вакансиями на hh.ru.</b>
+
+Ты описываешь, что ищешь — я каждые 5 минут проверяю новые вакансии и присылаю подходящие. Одна вакансия приходит только один раз.
+
+<b>С чего начать</b>
+1️⃣ «➕ Создать фильтр» — что и где искать
+2️⃣ «✏️ Редактировать резюме» — вставь своё резюме
+3️⃣ Дальше просто жди вакансии
+
+<b>Фильтры</b>
+Можно задать ключевые слова, город, зарплату, опыт, занятость, график и формат (офис / удалёнка / гибрид). Любой пункт можно пропустить.
+
+Несколько запросов сразу — через запятую, каждый ищется отдельно:
+<code>product analyst, продуктовый аналитик</code>
+Точная фраза — в кавычках: <code>"product manager"</code>
+Не знаешь, что вписать — нажми «💡 Предложить ключевые (ИИ)».
+
+Фильтры можно ставить на паузу, менять и удалять — «📋 Мои фильтры».
+
+<b>Что под каждой вакансией</b>
+🤖 <b>ИИ-отклик</b> — сопроводительное письмо по твоему резюме, добавится прямо под карточку. Пишется строго по резюме, без выдумок.
+🚫 <b>Скрыть все вакансии компании</b> — больше эта компания не побеспокоит.
+
+<b>Ещё умею</b>
+• Пришли ссылку на вакансию hh.ru прямо в чат — верну готовое письмо
+• «⚙️ Промпт ИИ» — переписать инструкцию для письма под себя
+
+<b>Команды</b>
+/filters — фильтры
+/newfilter — новый фильтр
+/blocked — скрытые компании
+/cancel — прервать текущий диалог
+/help — это сообщение"""
+
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(msg):
     if not is_owner(msg):
         return
     state_clear(msg.from_user.id)
-    bot.send_message(msg.chat.id,
-        "Привет!",
-        reply_markup=kb_menu()
-    )
+    bot.send_message(msg.chat.id, GREETING, disable_web_page_preview=True,
+                     reply_markup=kb_menu())
 
 
 @bot.message_handler(commands=["cancel"])
@@ -503,16 +489,25 @@ def cmd_newfilter(msg):
     _start_create(msg.from_user.id, msg.chat.id)
 
 
-@bot.message_handler(commands=["chatid"])
-def cmd_chatid(msg):
-    bot.send_message(msg.chat.id, f"Chat ID: <code>{msg.chat.id}</code>")
-
-
-@bot.message_handler(commands=["progress"])
-def cmd_progress(msg):
+@bot.message_handler(commands=["blocked"])
+def cmd_blocked(msg):
     if not is_owner(msg):
         return
-    _show_progress_menu(msg.chat.id)
+    state_clear(msg.from_user.id)
+    blocked = db.get_blocked_employers()
+    if not blocked:
+        bot.send_message(
+            msg.chat.id,
+            "🚫 <b>Скрытые компании</b>\n\nСписок пуст.\n\n"
+            "Чтобы скрыть компанию — нажми «🚫 Скрыть все вакансии компании» "
+            "под любой её вакансией.",
+        )
+        return
+    bot.send_message(
+        msg.chat.id,
+        f"🚫 <b>Скрытые компании</b> ({len(blocked)}):\n\nНажми, чтобы вернуть.",
+        reply_markup=kb_blocked_list(blocked),
+    )
 
 
 # ── Document handler (for .txt resume / prompt uploads) ───────────────────────
@@ -526,7 +521,7 @@ def handle_document(msg):
     st  = state_get(uid)
     step = st.get("step")
 
-    allowed_steps = ("resume_add_text", "resume_edit_text", "prompt_edit_file")
+    allowed_steps = ("resume_edit", "prompt_edit_file")
     if step not in allowed_steps:
         bot.send_message(cid, "📄 Файл получен, но сейчас файл не ожидается. "
                               "Используй /cancel для сброса состояния.")
@@ -553,28 +548,11 @@ def handle_document(msg):
 
 def _apply_resume_or_prompt_text(uid, cid, text, step, st):
     """Shared logic for saving text whether it came from message or file."""
-    d = st.get("data", {})
-
-    if step == "resume_add_text":
-        name = d.get("resume_name", "Резюме")
-        resume_id = db.add_resume(name, text)
+    if step == "resume_edit":
+        db.save_resume(text)
         state_clear(uid)
-        bot.send_message(
-            cid,
-            f"✅ Резюме «{name}» сохранено ({len(text)} символов).",
-            reply_markup=kb_resume_actions(resume_id),
-        )
-
-    elif step == "resume_edit_text":
-        resume_id = d.get("resume_id")
-        db.update_resume(resume_id, text=text)
-        state_clear(uid)
-        r = db.get_resume(resume_id)
-        bot.send_message(
-            cid,
-            f"✅ Текст резюме «{r['name']}» обновлён ({len(text)} символов).",
-            reply_markup=kb_resume_actions(resume_id),
-        )
+        bot.send_message(cid, f"✅ Резюме сохранено ({len(text)} символов).")
+        _show_resume(cid)
 
     elif step == "prompt_edit_file":
         # Validate placeholders
@@ -617,21 +595,13 @@ def handle_text(msg):
         state_clear(uid)
         _start_create(uid, cid)
         return
-    if text == BTN_PROGRESS:
+    if text == BTN_RESUME:
         state_clear(uid)
-        _show_progress_menu(cid)
-        return
-    if text == BTN_RESUMES:
-        state_clear(uid)
-        _show_resumes(cid)
+        _show_resume(cid)
         return
     if text == BTN_PROMPT:
         state_clear(uid)
         _show_prompt_menu(cid)
-        return
-    if text == BTN_LETTER:
-        state_clear(uid)
-        _show_letter_settings(cid)
         return
 
     if not step:
@@ -655,47 +625,9 @@ def _handle_text_inner(uid, cid, text, step, st):
     d  = st.get("data", {})
     nf = d.get("nf", {})
 
-    # ── Progress input ────────────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────────
 
-    if step == "prog_set_input":
-        if text.strip().isdigit():
-            db.set_progress(int(text.strip()))
-            state_clear(uid)
-            count = int(text.strip())
-            pct   = count / APPLY_GOAL * 100
-            bot.send_message(cid, f"✅ Прогресс: {count}/{APPLY_GOAL} ({pct:.1f}%)")
-        else:
-            bot.send_message(cid, "Введи целое число:")
-        return
-
-    # ── Resume flows ──────────────────────────────────────────────────────────
-
-    if step == "resume_add_name":
-        state_set(uid, "resume_add_text", resume_name=text)
-        bot.send_message(
-            cid,
-            f"📝 Название: <b>{text}</b>\n\n"
-            "Теперь отправь текст резюме (вставь текстом или загрузи .txt файл):",
-        )
-        return
-
-    if step == "resume_add_text":
-        _apply_resume_or_prompt_text(uid, cid, text, step, st)
-        return
-
-    if step == "resume_edit_name":
-        resume_id = d.get("resume_id")
-        db.update_resume(resume_id, name=text)
-        state_clear(uid)
-        r = db.get_resume(resume_id)
-        bot.send_message(
-            cid,
-            f"✅ Название обновлено: «{r['name']}».",
-            reply_markup=kb_resume_actions(resume_id),
-        )
-        return
-
-    if step == "resume_edit_text":
+    if step == "resume_edit":
         _apply_resume_or_prompt_text(uid, cid, text, step, st)
         return
 
@@ -1192,41 +1124,48 @@ def _cb(call):
 
     # ── Vacancy actions ───────────────────────────────────────────────────────
 
-    if data.startswith("hide_"):
+    if data.startswith("blk_"):
+        employer = _employer_from_card(
+            call.message.html_text if hasattr(call.message, "html_text")
+            else (call.message.text or "")
+        )
+        if not employer:
+            bot.answer_callback_query(call.id, "Не смог определить компанию 🤷")
+            return
+
+        db.block_employer(employer)
         try:
             bot.delete_message(cid, mid)
         except Exception as e:
-            log.warning("Could not delete message: %s", e)
+            log.warning("Could not delete blocked card: %s", e)
             bot.edit_message_reply_markup(cid, mid, reply_markup=None)
+        bot.send_message(
+            cid,
+            f"🚫 Компания <b>{html.escape(employer)}</b> скрыта.\n"
+            f"Её вакансии больше не придут. Список: /blocked",
+        )
         return
 
-    if data.startswith("appl_"):
-        count = db.inc_progress()
-        pct   = count / APPLY_GOAL * 100
-
-        if APPLIED_GROUP_ID:
-            try:
-                bot.forward_message(APPLIED_GROUP_ID, cid, mid)
-                filled = min(int(pct / 10), 10)
-                bar = "█" * filled + " " * (10 - filled)
-                bot.send_message(
-                    APPLIED_GROUP_ID,
-                    f"📊 Прогресс: <b>{count}/{APPLY_GOAL}</b>  |{bar}|  {pct:.0f}%",
-                )
-            except Exception as e:
-                log.error("Failed to forward to group: %s", e)
+    if data.startswith("unblk_"):
+        token = data[6:]
+        match = next((b for b in db.get_blocked_employers()
+                      if _emp_token(b["name_norm"]) == token), None)
+        if not match:
+            bot.answer_callback_query(call.id, "Компания не найдена")
+            return
+        db.unblock_employer(match["name_norm"])
+        blocked = db.get_blocked_employers()
+        if blocked:
+            bot.edit_message_text(
+                f"✅ <b>{html.escape(match['name'])}</b> разблокирована.\n\n"
+                f"🚫 <b>Скрытые компании</b> ({len(blocked)}):",
+                cid, mid, reply_markup=kb_blocked_list(blocked),
+            )
         else:
-            log.warning("APPLIED_GROUP_ID not set")
-
-        try:
-            m = InlineKeyboardMarkup()
-            m.add(InlineKeyboardButton(
-                f"✅ Откликнулся  ({count}/{APPLY_GOAL}  {pct:.0f}%)",
-                callback_data="noop",
-            ))
-            bot.edit_message_reply_markup(cid, mid, reply_markup=m)
-        except Exception:
-            pass
+            bot.edit_message_text(
+                f"✅ <b>{html.escape(match['name'])}</b> разблокирована.\n\n"
+                f"Скрытых компаний больше нет.", cid, mid,
+            )
         return
 
     # ── AI cover letter (from a vacancy card) ─────────────────────────────────
@@ -1240,91 +1179,35 @@ def _cb(call):
         _cover_from_card(cid, mid, vacancy_url, vacancy_id, msg_html)
         return
 
-    # ── Letter settings ───────────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────────
 
-    if data.startswith("setres_"):
-        db.set_setting("cover_resume_id", data[7:])
-        _show_letter_settings(cid, mid)
-        return
-
-    if data.startswith("setlie_"):
-        db.set_setting("cover_lie_level", data[7:])
-        _show_letter_settings(cid, mid)
-        return
-
-    # ── Resume management callbacks ───────────────────────────────────────────
-
-    if data == "res_list":
-        resumes = db.get_resumes()
-        if not resumes:
-            m = InlineKeyboardMarkup()
-            m.add(InlineKeyboardButton("➕ Добавить резюме", callback_data="res_add"))
-            bot.edit_message_text("📄 <b>Резюме</b>\n\nРезюме ещё нет.", cid, mid, reply_markup=m)
-        else:
-            bot.edit_message_text(f"📄 <b>Резюме</b> ({len(resumes)} шт.):",
-                                  cid, mid, reply_markup=kb_resume_list(resumes))
-        return
-
-    if data == "res_add":
-        state_set(uid, "resume_add_name")
+    if data == "res_edit":
+        state_set(uid, "resume_edit")
         bot.edit_message_text(
-            "📄 <b>Добавить резюме</b>\n\nВведи название резюме (например: «Python backend», «Product manager»):",
+            "📝 Отправь текст резюме — сообщением или .txt файлом.\n\n"
+            "Он полностью заменит текущий. /cancel — отмена.",
             cid, mid,
         )
         return
 
-    if data.startswith("res_open_"):
-        resume_id = int(data[9:])
-        r = db.get_resume(resume_id)
-        if not r:
-            bot.edit_message_text("Резюме не найдено.", cid, mid)
-            return
-        preview = r["text"][:600] + "\n…" if len(r["text"]) > 600 else r["text"]
-        bot.edit_message_text(
-            f"📄 <b>{r['name']}</b>\n\n<code>{preview}</code>",
-            cid, mid,
-            reply_markup=kb_resume_actions(resume_id),
-        )
-        return
-
-    if data.startswith("res_edit_name_"):
-        resume_id = int(data[14:])
-        state_set(uid, "resume_edit_name", resume_id=resume_id)
-        bot.edit_message_text("Введи новое название резюме:", cid, mid)
-        return
-
-    if data.startswith("res_edit_text_"):
-        resume_id = int(data[14:])
-        state_set(uid, "resume_edit_text", resume_id=resume_id)
-        bot.edit_message_text(
-            "Отправь новый текст резюме (или загрузи .txt файл):", cid, mid
-        )
-        return
-
-    if data.startswith("res_del_"):
-        resume_id = int(data[8:])
-        r = db.get_resume(resume_id)
-        name = r["name"] if r else "?"
+    if data == "res_del":
         m = InlineKeyboardMarkup()
         m.row(
-            InlineKeyboardButton("🗑 Да, удалить", callback_data=f"res_delok_{resume_id}"),
-            InlineKeyboardButton("Отмена",         callback_data=f"res_open_{resume_id}"),
+            InlineKeyboardButton("🗑 Да, удалить", callback_data="res_delok"),
+            InlineKeyboardButton("Отмена",         callback_data="res_back"),
         )
-        bot.edit_message_text(f"Удалить резюме «{name}»?", cid, mid, reply_markup=m)
+        bot.edit_message_text("Удалить резюме?", cid, mid, reply_markup=m)
         return
 
-    if data.startswith("res_delok_"):
-        resume_id = int(data[10:])
-        db.delete_resume(resume_id)
+    if data == "res_delok":
+        db.delete_resume()
         state_clear(uid)
-        resumes = db.get_resumes()
-        if resumes:
-            bot.edit_message_text(f"🗑 Удалено.\n\n📄 <b>Резюме</b> ({len(resumes)} шт.):",
-                                  cid, mid, reply_markup=kb_resume_list(resumes))
-        else:
-            m = InlineKeyboardMarkup()
-            m.add(InlineKeyboardButton("➕ Добавить резюме", callback_data="res_add"))
-            bot.edit_message_text("🗑 Удалено. Резюме больше нет.", cid, mid, reply_markup=m)
+        bot.edit_message_text("🗑 Резюме удалено.", cid, mid,
+                              reply_markup=kb_resume_actions(False))
+        return
+
+    if data == "res_back":
+        _show_resume(cid, mid)
         return
 
     # ── Prompt management callbacks ───────────────────────────────────────────
@@ -1365,20 +1248,6 @@ def _cb(call):
         )
         return
 
-    # ── Progress management ───────────────────────────────────────────────────
-
-    if data in ("prog_inc", "prog_reset", "prog_set"):
-        if data == "prog_inc":
-            db.inc_progress()
-        elif data == "prog_reset":
-            db.set_progress(0)
-        elif data == "prog_set":
-            state_set(uid, "prog_set_input")
-            bot.send_message(cid, "Введи новое значение прогресса (число):")
-            return
-        _show_progress_edit(cid, mid)
-        return
-
 
 # ── AI generation (background thread) ────────────────────────────────────────
 
@@ -1396,32 +1265,25 @@ def _normalize_vacancy_url(raw: str) -> str | None:
     return None
 
 
-def _build_letter(vacancy_url: str, resume_id: int, lie_level: int) -> str:
+def _build_letter(vacancy_url: str) -> str:
     """Synchronously fetch the vacancy page and produce the cover letter text."""
-    resume_text = None
-    if resume_id:
-        r = db.get_resume(resume_id)
-        resume_text = r["text"] if r else None
-
     prompt_template = db.get_setting("groq_prompt") or None
     page_text = ai.fetch_vacancy_page(vacancy_url)
     return ai.generate_cover_letter(
         vacancy_card_text="",
         vacancy_page_text=page_text,
-        resume_text=resume_text,
-        lie_level=lie_level,
+        resume_text=db.get_resume_text() or None,
         prompt_template=prompt_template,
     )
 
 
 def _cover_from_link(cid: int, url: str):
     """Plain link pasted in chat → reply with ONLY the cover letter (copyable)."""
-    resume_id, lie_level = _resolve_cover_settings()
     host = bot.send_message(cid, "✉️ Пишу сопроводительное…")
     mid = host.message_id
 
     def _worker():
-        letter = _build_letter(url, resume_id, lie_level)
+        letter = _build_letter(url)
         safe = html.escape(letter)
         try:
             # Only the letter, inside a code block → tap to copy
@@ -1439,8 +1301,6 @@ def _cover_from_link(cid: int, url: str):
 def _cover_from_card(cid: int, card_mid: int, vacancy_url: str,
                      vacancy_id: str, card_html: str):
     """ИИ-отклик button → append the letter to the vacancy message in a code block."""
-    resume_id, lie_level = _resolve_cover_settings()
-
     # Spinner on the button
     try:
         spinner = InlineKeyboardMarkup()
@@ -1453,7 +1313,7 @@ def _cover_from_card(cid: int, card_mid: int, vacancy_url: str,
     base_html = re.split(r"\n\n<pre>", card_html)[0]
 
     def _worker():
-        letter = _build_letter(vacancy_url, resume_id, lie_level)
+        letter = _build_letter(vacancy_url)
         safe = html.escape(letter)
         new_html = f"{base_html}\n\n<pre>{safe}</pre>"
         try:
@@ -1531,6 +1391,9 @@ def _run_check():
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    if not OWNER_ID:
+        raise SystemExit("OWNER_ID is not set — add it to .env / Railway variables.")
+
     db.init_db()
     log.info("DB ready.")
 
