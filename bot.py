@@ -84,14 +84,15 @@ BTN_FILTERS = "📋 Мои фильтры"
 BTN_CREATE  = "➕ Создать фильтр"
 BTN_RESUME  = "✏️ Редактировать резюме"
 BTN_BLOCKED = "🚫 Скрытые компании"
-BTN_PROMPT  = "⚙️ Промпт ИИ"
+BTN_PROMPT  = "⚙️ Редактировать промт для сопроводительного"
 
 
 def kb_menu():
     m = ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(KeyboardButton(BTN_FILTERS), KeyboardButton(BTN_CREATE))
     m.row(KeyboardButton(BTN_RESUME))
-    m.row(KeyboardButton(BTN_BLOCKED), KeyboardButton(BTN_PROMPT))
+    m.row(KeyboardButton(BTN_PROMPT))
+    m.row(KeyboardButton(BTN_BLOCKED))
     return m
 
 
@@ -405,7 +406,7 @@ def _show_prompt_menu(cid: int):
         status = "📋 <b>Стандартный промпт:</b>"
 
     text = (
-        f"⚙️ <b>Промпт ИИ</b>\n\n"
+        f"⚙️ <b>Промт для сопроводительного</b>\n\n"
         f"{status}\n"
         f"<code>{preview}</code>\n\n"
         f"<b>Плейсхолдеры:</b>\n"
