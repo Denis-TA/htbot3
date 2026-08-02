@@ -19,9 +19,11 @@ HH_CLIENT_SECRET = os.getenv("HH_CLIENT_SECRET", "")
 # Groq AI — up to 5 keys for round-robin on rate limits (429).
 # Railway requires every referenced var to exist, so a key set to "123"
 # is treated as a placeholder and ignored.
+# The first slot also accepts the older unsuffixed GROQ_API_KEY, so setups
+# created before the keys were renamed keep working.
 def _collect_groq_keys() -> list:
     raw = [
-        os.getenv("GROQ_API_KEY", ""),
+        os.getenv("GROQ_API_KEY_1", "") or os.getenv("GROQ_API_KEY", ""),
         os.getenv("GROQ_API_KEY_2", ""),
         os.getenv("GROQ_API_KEY_3", ""),
         os.getenv("GROQ_API_KEY_4", ""),

@@ -51,7 +51,7 @@ def _groq_chat(payload: dict, timeout: int = 30) -> str:
     Returns the assistant message text, or raises GroqError.
     """
     if not GROQ_API_KEYS:
-        raise GroqError("GROQ_API_KEY не задан в .env / переменных Railway")
+        raise GroqError("GROQ_API_KEY_1 не задан в .env / переменных Railway")
 
     routes = [("proxy", _PROXIES), ("direct", {})]
     last_err = "unknown"
