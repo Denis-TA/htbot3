@@ -83,6 +83,7 @@ WORK_FORMAT_OPTIONS = [
 BTN_FILTERS = "📋 Мои фильтры"
 BTN_CREATE  = "➕ Создать фильтр"
 BTN_RESUME  = "✏️ Редактировать резюме"
+BTN_BLOCKED = "🚫 Скрытые компании"
 BTN_PROMPT  = "⚙️ Промпт ИИ"
 
 
@@ -90,7 +91,7 @@ def kb_menu():
     m = ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(KeyboardButton(BTN_FILTERS), KeyboardButton(BTN_CREATE))
     m.row(KeyboardButton(BTN_RESUME))
-    m.row(KeyboardButton(BTN_PROMPT))
+    m.row(KeyboardButton(BTN_BLOCKED), KeyboardButton(BTN_PROMPT))
     return m
 
 
@@ -377,6 +378,23 @@ def _show_resume(cid: int, mid: int = None):
     bot.send_message(cid, text, reply_markup=kb)
 
 
+def _show_blocked(cid: int):
+    blocked = db.get_blocked_employers()
+    if not blocked:
+        bot.send_message(
+            cid,
+            "🚫 <b>Скрытые компании</b>\n\nСписок пуст.\n\n"
+            "Чтобы скрыть компанию — нажми «🚫 Скрыть все вакансии компании» "
+            "под любой её вакансией.",
+        )
+        return
+    bot.send_message(
+        cid,
+        f"🚫 <b>Скрытые компании</b> ({len(blocked)}):\n\nНажми, чтобы вернуть.",
+        reply_markup=kb_blocked_list(blocked),
+    )
+
+
 def _show_prompt_menu(cid: int):
     saved = db.get_setting("groq_prompt")
     if saved:
@@ -429,32 +447,34 @@ GREETING = """\
 <b>С чего начать</b>
 1️⃣ «➕ Создать фильтр» — что и где искать
 2️⃣ «✏️ Редактировать резюме» — вставь своё резюме
-3️⃣ Дальше просто жди вакансии
+3️⃣ Дальше просто жди — вакансии придут сами
+
+<b>Что ещё умею</b>
+🤖 <b>ИИ-отклик</b> — кнопка под каждой вакансией. Напишу сопроводительное по твоему резюме и добавлю прямо под карточку. Строго по резюме, без выдумок.
+🔗 <b>Письмо по ссылке</b> — пришли ссылку на вакансию hh.ru в чат, верну готовое письмо.
+🚫 <b>Скрытые компании</b> — надоел работодатель? Кнопка под вакансией уберёт его навсегда, список — в меню.
+💡 <b>Подсказка ключевых слов</b> — не знаешь, что вписать в фильтр, нажми кнопку и ИИ предложит варианты.
+⚙️ <b>Промпт ИИ</b> — переписать инструкцию, по которой пишутся письма.
+📋 <b>Мои фильтры</b> — менять, ставить на паузу, удалять.
 
 <b>Фильтры</b>
-Можно задать ключевые слова, город, зарплату, опыт, занятость, график и формат (офис / удалёнка / гибрид). Любой пункт можно пропустить.
-
+Ключевые слова, город, зарплата, опыт, занятость, график, формат (офис / удалёнка / гибрид). Любой пункт можно пропустить.
 Несколько запросов сразу — через запятую, каждый ищется отдельно:
 <code>product analyst, продуктовый аналитик</code>
 Точная фраза — в кавычках: <code>"product manager"</code>
-Не знаешь, что вписать — нажми «💡 Предложить ключевые (ИИ)».
 
-Фильтры можно ставить на паузу, менять и удалять — «📋 Мои фильтры».
-
-<b>Что под каждой вакансией</b>
-🤖 <b>ИИ-отклик</b> — сопроводительное письмо по твоему резюме, добавится прямо под карточку. Пишется строго по резюме, без выдумок.
-🚫 <b>Скрыть все вакансии компании</b> — больше эта компания не побеспокоит.
-
-<b>Ещё умею</b>
-• Пришли ссылку на вакансию hh.ru прямо в чат — верну готовое письмо
-• «⚙️ Промпт ИИ» — переписать инструкцию для письма под себя
+<b>Чтобы ИИ-отклик работал</b>
+Нужен бесплатный ключ Groq (console.groq.com/keys) — вписать его в переменную окружения <code>GROQ_API_KEY</code>.
+Ключей можно добавить до пяти: <code>GROQ_API_KEY_2</code> … <code>GROQ_API_KEY_5</code>. Когда лимит одного заканчивается, я сам переключаюсь на следующий — так писем в день получается больше.
 
 <b>Команды</b>
 /filters — фильтры
 /newfilter — новый фильтр
 /blocked — скрытые компании
-/cancel — прервать текущий диалог
-/help — это сообщение"""
+/cancel — прервать диалог
+/help — это сообщение
+
+Бот создан @dsf637"""
 
 
 @bot.message_handler(commands=["start", "help"])
@@ -494,20 +514,7 @@ def cmd_blocked(msg):
     if not is_owner(msg):
         return
     state_clear(msg.from_user.id)
-    blocked = db.get_blocked_employers()
-    if not blocked:
-        bot.send_message(
-            msg.chat.id,
-            "🚫 <b>Скрытые компании</b>\n\nСписок пуст.\n\n"
-            "Чтобы скрыть компанию — нажми «🚫 Скрыть все вакансии компании» "
-            "под любой её вакансией.",
-        )
-        return
-    bot.send_message(
-        msg.chat.id,
-        f"🚫 <b>Скрытые компании</b> ({len(blocked)}):\n\nНажми, чтобы вернуть.",
-        reply_markup=kb_blocked_list(blocked),
-    )
+    _show_blocked(msg.chat.id)
 
 
 # ── Document handler (for .txt resume / prompt uploads) ───────────────────────
@@ -598,6 +605,10 @@ def handle_text(msg):
     if text == BTN_RESUME:
         state_clear(uid)
         _show_resume(cid)
+        return
+    if text == BTN_BLOCKED:
+        state_clear(uid)
+        _show_blocked(cid)
         return
     if text == BTN_PROMPT:
         state_clear(uid)
